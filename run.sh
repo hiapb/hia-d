@@ -748,151 +748,128 @@ manage_goods_sold_count() {
 
     [[ -z "$db_file" || ! -f "$db_file" ]] && {
         err "未找到 SQLite 数据库文件。"
-        echo "搜索目录: $workdir/data/db"
         return
     }
 
     info "数据库文件: $db_file"
 
-    local goods_table
-    goods_table="$(sqlite3 "$db_file" "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('goods','products','product','items') LIMIT 1;")"
+    local goods_table="goods"
+    local sold_col="manual_stock_sold"
+    local category_col="category_id"
 
-    [[ -z "$goods_table" ]] && {
-        err "未找到商品表。"
-        echo "当前数据库表："
-        sqlite3 "$db_file" ".tables"
-        return
-    }
-
-    local sold_col=""
-    for col in manual_stock_sold sold_count sold sales sales_count sold_num volume sales_volume; do
-        if sqlite3 "$db_file" "PRAGMA table_info($goods_table);" | awk -F'|' '{print $2}' | grep -qx "$col"; then
-            sold_col="$col"
-            break
-        fi
-    done
-
-    [[ -z "$sold_col" ]] && {
-        err "未找到已售数量字段。"
-        echo "商品表字段："
-        sqlite3 "$db_file" "PRAGMA table_info($goods_table);"
-        return
-    }
-
-    local name_col=""
-    for col in title_json name title goods_name product_name; do
-        if sqlite3 "$db_file" "PRAGMA table_info($goods_table);" | awk -F'|' '{print $2}' | grep -qx "$col"; then
-            name_col="$col"
-            break
-        fi
-    done
-
-    [[ -z "$name_col" ]] && {
-        err "未找到商品名称字段。"
-        echo "商品表字段："
-        sqlite3 "$db_file" "PRAGMA table_info($goods_table);"
-        return
-    }
-
-    local category_col=""
-    for col in category_id cate_id group_id class_id; do
-        if sqlite3 "$db_file" "PRAGMA table_info($goods_table);" | awk -F'|' '{print $2}' | grep -qx "$col"; then
-            category_col="$col"
-            break
-        fi
-    done
-
-    local category_table=""
-    for tbl in categories category goods_categories goods_category product_categories product_category; do
-        if sqlite3 "$db_file" "SELECT name FROM sqlite_master WHERE type='table' AND name='$tbl';" | grep -qx "$tbl"; then
-            category_table="$tbl"
-            break
-        fi
-    done
-
-    local category_name_col=""
-    if [[ -n "$category_table" ]]; then
-        for col in name title category_name cate_name; do
-            if sqlite3 "$db_file" "PRAGMA table_info($category_table);" | awk -F'|' '{print $2}' | grep -qx "$col"; then
-                category_name_col="$col"
-                break
-            fi
-        done
-    fi
+    local name_expr
+    name_expr="COALESCE(NULLIF(json_extract(title_json, '\$.zh-CN'), ''), NULLIF(json_extract(title_json, '\$.zh-TW'), ''), NULLIF(json_extract(title_json, '\$.en-US'), ''), title_json)"
 
     echo ""
     echo "==================================================="
     echo "              修改商品已售数量"
     echo "==================================================="
 
-    local selected_category=""
+    echo "分类列表："
+    echo "---------------------------------------------------"
+    sqlite3 -header -column "$db_file" "
+        SELECT DISTINCT $category_col AS 分类ID
+        FROM $goods_table
+        ORDER BY $category_col ASC;
+    "
+    echo "---------------------------------------------------"
 
-    if [[ -n "$category_table" && -n "$category_col" && -n "$category_name_col" ]]; then
-        echo "分类列表："
-        echo "---------------------------------------------------"
-        sqlite3 -header -column "$db_file" "SELECT id AS 分类ID, $category_name_col AS 分类名称 FROM $category_table ORDER BY id ASC;"
-        echo "---------------------------------------------------"
-        read -r -p "请输入分类ID: " selected_category
+    read -r -p "请输入分类ID: " selected_category
 
-        [[ ! "$selected_category" =~ ^[0-9]+$ ]] && {
-            err "分类ID非法。"
-            return
-        }
+    [[ ! "$selected_category" =~ ^[0-9]+$ ]] && {
+        err "分类ID非法。"
+        return
+    }
 
-        echo ""
-        echo "商品列表："
-        echo "---------------------------------------------------"
-        sqlite3 -header -column "$db_file" "SELECT id AS 商品ID, $name_col AS 商品名称, $sold_col AS 已售数量 FROM $goods_table WHERE $category_col=$selected_category ORDER BY id ASC;"
-    else
-        warn "未识别到分类表或分类字段，将列出全部商品。"
-        echo ""
-        echo "商品列表："
-        echo "---------------------------------------------------"
-        sqlite3 -header -column "$db_file" "SELECT id AS 商品ID, $name_col AS 商品名称, $sold_col AS 已售数量 FROM $goods_table ORDER BY id ASC;"
-    fi
-
+    echo ""
+    echo "商品列表："
+    echo "---------------------------------------------------"
+    sqlite3 -header -column "$db_file" "
+        SELECT
+            id AS 商品ID,
+            $name_expr AS 商品名称,
+            manual_stock_total AS 库存总数,
+            manual_stock_locked AS 锁定数量,
+            $sold_col AS 已售数量
+        FROM $goods_table
+        WHERE $category_col=$selected_category
+        ORDER BY id ASC;
+    "
     echo "---------------------------------------------------"
 
     read -r -p "请输入要修改的商品ID: " goods_id
+
     [[ ! "$goods_id" =~ ^[0-9]+$ ]] && {
         err "商品ID非法。"
         return
     }
 
     local exists
-    if [[ -n "$selected_category" && -n "$category_col" ]]; then
-        exists="$(sqlite3 "$db_file" "SELECT COUNT(*) FROM $goods_table WHERE id=$goods_id AND $category_col=$selected_category;")"
-    else
-        exists="$(sqlite3 "$db_file" "SELECT COUNT(*) FROM $goods_table WHERE id=$goods_id;")"
-    fi
+    exists="$(sqlite3 "$db_file" "SELECT COUNT(*) FROM $goods_table WHERE id=$goods_id AND $category_col=$selected_category;")"
 
     [[ "$exists" != "1" ]] && {
         err "商品不存在。"
         return
     }
 
-    local current_info
-    current_info="$(sqlite3 "$db_file" "SELECT $name_col || ' 当前已售: ' || $sold_col FROM $goods_table WHERE id=$goods_id;")"
-    echo "$current_info"
+    sqlite3 -header -column "$db_file" "
+        SELECT
+            id AS 商品ID,
+            $name_expr AS 商品名称,
+            manual_stock_total AS 库存总数,
+            manual_stock_locked AS 锁定数量,
+            $sold_col AS 当前已售
+        FROM $goods_table
+        WHERE id=$goods_id;
+    "
 
     read -r -p "请输入新的已售数量: " new_sold
+
     [[ ! "$new_sold" =~ ^[0-9]+$ ]] && {
         err "已售数量必须是非负整数。"
         return
     }
 
-    sqlite3 "$db_file" "UPDATE $goods_table SET $sold_col=$new_sold WHERE id=$goods_id;" || {
+    sqlite3 "$db_file" "
+        UPDATE $goods_table
+        SET
+            $sold_col=$new_sold,
+            updated_at=datetime('now')
+        WHERE id=$goods_id;
+    " || {
         err "修改失败。"
         return
     }
 
+    info "数据库已修改，正在清理缓存..."
+
+    local redis_pass
+    redis_pass="$(grep -oP '^REDIS_PASSWORD=\K.*' "$workdir/.env" 2>/dev/null || true)"
+
+    if [[ -n "$redis_pass" ]]; then
+        docker exec "$REDIS_CONTAINER" redis-cli -a "$redis_pass" FLUSHDB >/dev/null 2>&1 || true
+    fi
+
+    docker restart "$API_CONTAINER" >/dev/null 2>&1 || true
+    docker restart "$ADMIN_GATEWAY_CONTAINER" >/dev/null 2>&1 || true
+    docker restart "$USER_GATEWAY_CONTAINER" >/dev/null 2>&1 || true
+
     info "修改完成。"
 
     echo ""
-    sqlite3 -header -column "$db_file" "SELECT id AS 商品ID, $name_col AS 商品名称, $sold_col AS 已售数量 FROM $goods_table WHERE id=$goods_id;"
+    sqlite3 -header -column "$db_file" "
+        SELECT
+            id AS 商品ID,
+            $name_expr AS 商品名称,
+            manual_stock_total AS 库存总数,
+            manual_stock_locked AS 锁定数量,
+            $sold_col AS 已售数量
+        FROM $goods_table
+        WHERE id=$goods_id;
+    "
 
-    docker restart "$API_CONTAINER" >/dev/null 2>&1 || true
-    docker restart "$USER_GATEWAY_CONTAINER" >/dev/null 2>&1 || true
+    echo ""
+    warn "浏览器后台页面请 Ctrl + F5 强制刷新。"
 }
 
 uninstall_service() {
