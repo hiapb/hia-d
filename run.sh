@@ -1002,9 +1002,6 @@ manage_goods_sold_count() {
     info "修改完成。"
 
     echo ""
-    warn "如果后台还是 0，说明后台页面不是读 products/product_skus，而是读订单统计。"
-    warn "这时需要改 orders/order_items 统计数据，不是库存表字段。"
-    warn "先 Ctrl + F5 强制刷新后台页面。"
 }
 
 
