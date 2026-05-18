@@ -989,7 +989,7 @@ show_logs() {
 main_menu() {
     clear
     echo "==================================================="
-    echo "              Dujiao-Next 一键管理"
+    echo "              Dujiao-Next 一键管理1"
     echo "==================================================="
 
     local wd
