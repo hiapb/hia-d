@@ -6,16 +6,11 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 DEFAULT_INSTALL_PATH="/opt/dujiao-next"
 ENV_RECORD_FILE="/etc/dujiaonext_env"
-COMPOSE_FILE="docker-compose.sqlite.yml"
+COMPOSE_FILE="docker-compose.yml"
 
 CRON_TAG_BEGIN="# DUJIAO_NEXT_BACKUP_BEGIN"
 CRON_TAG_END="# DUJIAO_NEXT_BACKUP_END"
 BACKUP_LOG="/var/log/dujiaonext_backup.log"
-
-API_CONTAINER="dujiaonext-api"
-USER_CONTAINER="dujiaonext-user"
-ADMIN_CONTAINER="dujiaonext-admin"
-REDIS_CONTAINER="dujiaonext-redis"
 
 DEFAULT_API_PORT="39180"
 DEFAULT_USER_PORT="34567"
@@ -24,6 +19,13 @@ DEFAULT_ADMIN_PORT="39282"
 ADMIN_USER="admin"
 ADMIN_PASS=""
 REDIS_PASS=""
+
+API_CONTAINER="dujiaonext-api"
+USER_CONTAINER="dujiaonext-user"
+ADMIN_CONTAINER="dujiaonext-admin"
+REDIS_CONTAINER="dujiaonext-redis"
+USER_GATEWAY_CONTAINER="dujiaonext-user-gateway"
+ADMIN_GATEWAY_CONTAINER="dujiaonext-admin-gateway"
 
 info() { echo -e "\033[32m[INFO]\033[0m $1"; }
 warn() { echo -e "\033[33m[WARN]\033[0m $1" >&2; }
@@ -49,7 +51,7 @@ docker_compose_cmd() {
     elif command -v docker-compose >/dev/null 2>&1; then
         echo "docker-compose"
     else
-        die "未检测到 Docker Compose，请先安装 Docker / Docker Compose。"
+        die "未检测到 Docker Compose。"
     fi
 }
 
@@ -70,15 +72,12 @@ generate_passwords() {
 
 write_pwd_file() {
     local workdir="$1"
-
     mkdir -p "${workdir}/config"
-
     {
         echo "后台账号: ${ADMIN_USER}"
         echo "后台密码: ${ADMIN_PASS}"
         echo "Redis密码: ${REDIS_PASS}"
     } > "${workdir}/config/passwords.txt"
-
     chmod 600 "${workdir}/config/passwords.txt"
 }
 
@@ -90,7 +89,7 @@ read_pwd_file() {
 create_compose_file() {
     local workdir="$1"
 
-    cat > "${workdir}/${COMPOSE_FILE}" <<'DOCKEREOF'
+    cat > "${workdir}/${COMPOSE_FILE}" <<'EOF'
 services:
   redis:
     image: redis:7-alpine
@@ -125,6 +124,11 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
     networks:
       - dujiao-net
 
@@ -132,12 +136,11 @@ services:
     image: dujiaonext/user:${TAG}
     container_name: dujiaonext-user
     restart: unless-stopped
-    environment:
-      TZ: ${TZ}
-    ports:
-      - "${USER_BIND_IP}:${USER_PORT}:80"
+    expose:
+      - "80"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     networks:
       - dujiao-net
 
@@ -145,11 +148,38 @@ services:
     image: dujiaonext/admin:${TAG}
     container_name: dujiaonext-admin
     restart: unless-stopped
-    environment:
-      TZ: ${TZ}
+    expose:
+      - "80"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - dujiao-net
+
+  user-gateway:
+    image: nginx:alpine
+    container_name: dujiaonext-user-gateway
+    restart: unless-stopped
+    ports:
+      - "${USER_BIND_IP}:${USER_PORT}:80"
+    volumes:
+      - ./nginx/user.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - user
+      - api
+    networks:
+      - dujiao-net
+
+  admin-gateway:
+    image: nginx:alpine
+    container_name: dujiaonext-admin-gateway
+    restart: unless-stopped
     ports:
       - "${ADMIN_BIND_IP}:${ADMIN_PORT}:80"
+    volumes:
+      - ./nginx/admin.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
+      - admin
       - api
     networks:
       - dujiao-net
@@ -157,7 +187,88 @@ services:
 networks:
   dujiao-net:
     driver: bridge
-DOCKEREOF
+EOF
+}
+
+create_nginx_files() {
+    local workdir="$1"
+    mkdir -p "${workdir}/nginx"
+
+    cat > "${workdir}/nginx/user.conf" <<'EOF'
+server {
+    listen 80;
+    server_name _;
+
+    client_max_body_size 100m;
+
+    location / {
+        proxy_pass http://user:80;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /api/ {
+        proxy_pass http://api:8080/api/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /uploads/ {
+        proxy_pass http://api:8080/uploads/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location = /sitemap.xml {
+        proxy_pass http://api:8080/sitemap.xml;
+        proxy_set_header Host $host;
+    }
+
+    location = /robots.txt {
+        proxy_pass http://api:8080/robots.txt;
+        proxy_set_header Host $host;
+    }
+}
+EOF
+
+    cat > "${workdir}/nginx/admin.conf" <<'EOF'
+server {
+    listen 80;
+    server_name _;
+
+    client_max_body_size 100m;
+
+    location / {
+        proxy_pass http://admin:80;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /api/ {
+        proxy_pass http://api:8080/api/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /uploads/ {
+        proxy_pass http://api:8080/uploads/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+EOF
 }
 
 download_config() {
@@ -176,56 +287,38 @@ download_config() {
 patch_config_yml() {
     local workdir="$1"
     local cfg="${workdir}/config/config.yml"
-
     [[ -f "$cfg" ]] || die "config.yml 不存在。"
 
     python3 - "$cfg" "$REDIS_PASS" <<'PYEOF'
-import sys
-import re
-import secrets
-import string
+import sys, re, secrets, string
 
 path = sys.argv[1]
 redis_pass = sys.argv[2]
 
 text = open(path, "r", encoding="utf-8").read()
-
 text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+redis_block = f"""redis:
+  host: redis
+  port: 6379
+  password: {redis_pass}
+  db: 0
+"""
+
+if re.search(r'(?m)^redis:\s*$', text):
+    text = re.sub(r'(?ms)^redis:\s*\n(?:^[ \t]+.*\n?)*', redis_block, text, count=1)
+else:
+    text += "\n\n" + redis_block
 
 text = re.sub(r'(?m)^(\s*host:\s*)(127\.0\.0\.1|localhost)\s*$', r'\1redis', text)
 
-if re.search(r'(?m)^redis:\s*$', text):
-    text = re.sub(
-        r'(?ms)^redis:\s*\n(?:^[ \t]+.*\n?)*',
-        f'''redis:
-  host: redis
-  port: 6379
-  password: {redis_pass}
-  db: 0
-''',
-        text,
-        count=1
-    )
-else:
-    text += f'''
-
-redis:
-  host: redis
-  port: 6379
-  password: {redis_pass}
-  db: 0
-'''
-
-text = re.sub(r'(?m)^(\s*driver:\s*)mysql\s*$', r'\1sqlite', text)
-text = re.sub(r'(?m)^(\s*driver:\s*)postgres\s*$', r'\1sqlite', text)
+text = re.sub(r'(?m)^(\s*driver:\s*)(mysql|postgres|postgresql)\s*$', r'\1sqlite', text)
 text = re.sub(r'(?m)^(\s*dsn:\s*).+$', r'\1/app/db/dujiao.db', text)
 
 alphabet = string.ascii_letters + string.digits
-jwt1 = ''.join(secrets.choice(alphabet) for _ in range(48))
-jwt2 = ''.join(secrets.choice(alphabet) for _ in range(48))
+secret = ''.join(secrets.choice(alphabet) for _ in range(48))
 
-text = re.sub(r'(?m)^(\s*secret:\s*)your.*$', r'\1' + jwt1, text, count=1)
-text = re.sub(r'(?m)^(\s*secret:\s*)change.*$', r'\1' + jwt2, text, count=1)
+text = re.sub(r'(?m)^(\s*secret:\s*)(your.*|change.*|please.*)$', r'\1' + secret, text)
 
 open(path, "w", encoding="utf-8", newline="\n").write(text)
 PYEOF
@@ -239,7 +332,7 @@ write_env_file() {
     local user_bind_ip="$5"
     local admin_bind_ip="$6"
 
-    cat > "${workdir}/.env" <<ENVEFF
+    cat > "${workdir}/.env" <<EOF
 TAG=latest
 TZ=Asia/Shanghai
 
@@ -254,7 +347,7 @@ DJ_DEFAULT_ADMIN_USERNAME=${ADMIN_USER}
 DJ_DEFAULT_ADMIN_PASSWORD=${ADMIN_PASS}
 
 REDIS_PASSWORD=${REDIS_PASS}
-ENVEFF
+EOF
 }
 
 show_access() {
@@ -275,17 +368,13 @@ show_access() {
     echo "--------------------------------------------------"
     echo -e "API 检测: \033[36mhttp://127.0.0.1:${api_port}/health\033[0m"
 
-    if [[ "$user_bind_ip" == "0.0.0.0" ]]; then
-        echo -e "前台地址: \033[36mhttp://${ip}:${user_port}\033[0m"
-    else
-        echo -e "前台地址: \033[36mhttp://127.0.0.1:${user_port}\033[0m"
-    fi
+    [[ "$user_bind_ip" == "0.0.0.0" ]] \
+        && echo -e "前台地址: \033[36mhttp://${ip}:${user_port}\033[0m" \
+        || echo -e "前台地址: \033[36mhttp://127.0.0.1:${user_port}\033[0m"
 
-    if [[ "$admin_bind_ip" == "0.0.0.0" ]]; then
-        echo -e "后台地址: \033[36mhttp://${ip}:${admin_port}\033[0m"
-    else
-        echo -e "后台地址: \033[36mhttp://127.0.0.1:${admin_port}\033[0m"
-    fi
+    [[ "$admin_bind_ip" == "0.0.0.0" ]] \
+        && echo -e "后台地址: \033[36mhttp://${ip}:${admin_port}\033[0m" \
+        || echo -e "后台地址: \033[36mhttp://127.0.0.1:${admin_port}\033[0m"
 
     echo "--------------------------------------------------"
     echo "$(read_pwd_file "$workdir")"
@@ -296,14 +385,15 @@ show_access() {
 }
 
 wait_app_ready() {
-    info "等待容器启动..."
+    local port
+    port="$(grep -oP '^API_PORT=\K.*' .env 2>/dev/null || echo "$DEFAULT_API_PORT")"
+
+    info "等待 API 启动..."
 
     for i in {1..60}; do
-        if docker ps --format '{{.Names}} {{.Status}}' | grep -q "^${API_CONTAINER} .*Up"; then
-            if curl -fsSL "http://127.0.0.1:$(grep -oP '^API_PORT=\K.*' .env)/health" >/dev/null 2>&1; then
-                info "API 已就绪。"
-                return 0
-            fi
+        if curl -fsSL "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+            info "API 已就绪。"
+            return 0
         fi
         sleep 2
     done
@@ -331,7 +421,7 @@ deploy_dujiao_next() {
 
     if [[ -d "$install_path" && "$(ls -A "$install_path" 2>/dev/null)" ]]; then
         err "目标目录已存在且非空：$install_path"
-        err "请先执行菜单 [8] 完全卸载，或换一个目录。"
+        err "请先执行 [8] 完全卸载，或换一个目录。"
         return
     fi
 
@@ -351,16 +441,12 @@ deploy_dujiao_next() {
     local admin_bind_ip="127.0.0.1"
 
     read -r -p "前台是否允许公网直接访问？(y/N): " public_user
-    if [[ "$public_user" =~ ^[Yy]$ ]]; then
-        user_bind_ip="0.0.0.0"
-    fi
+    [[ "$public_user" =~ ^[Yy]$ ]] && user_bind_ip="0.0.0.0"
 
     read -r -p "后台是否允许公网直接访问？不建议开启 (y/N): " public_admin
-    if [[ "$public_admin" =~ ^[Yy]$ ]]; then
-        admin_bind_ip="0.0.0.0"
-    fi
+    [[ "$public_admin" =~ ^[Yy]$ ]] && admin_bind_ip="0.0.0.0"
 
-    mkdir -p "$install_path"/{config,data/db,data/uploads,data/logs,data/redis,backups}
+    mkdir -p "$install_path"/{config,nginx,data/db,data/uploads,data/logs,data/redis,backups}
     chmod -R 0777 "$install_path"/data 2>/dev/null || true
 
     echo "$install_path" > "$ENV_RECORD_FILE"
@@ -370,6 +456,7 @@ deploy_dujiao_next() {
     write_pwd_file "$install_path"
     write_env_file "$install_path" "$api_port" "$user_port" "$admin_port" "$user_bind_ip" "$admin_bind_ip"
     create_compose_file "$install_path"
+    create_nginx_files "$install_path"
     download_config "$install_path"
     patch_config_yml "$install_path"
 
@@ -392,6 +479,12 @@ upgrade_service() {
 
     cd "$workdir" || return
 
+    REDIS_PASS="$(grep -oP '^REDIS_PASSWORD=\K.*' .env 2>/dev/null || true)"
+    [[ -n "$REDIS_PASS" ]] && patch_config_yml "$workdir"
+
+    create_nginx_files "$workdir"
+    create_compose_file "$workdir"
+
     info "开始升级..."
     compose_run pull || die "镜像拉取失败。"
     compose_run up -d --force-recreate || die "服务重建失败。"
@@ -403,12 +496,7 @@ upgrade_service() {
 pause_service() {
     local workdir
     workdir="$(get_workdir)"
-
-    [[ -z "$workdir" ]] && {
-        err "未发现部署环境。"
-        return
-    }
-
+    [[ -z "$workdir" ]] && { err "未发现部署环境。"; return; }
     cd "$workdir" || return
     compose_run stop
     info "服务已停止。"
@@ -417,121 +505,17 @@ pause_service() {
 restart_service() {
     local workdir
     workdir="$(get_workdir)"
-
-    [[ -z "$workdir" ]] && {
-        err "未发现部署环境。"
-        return
-    }
+    [[ -z "$workdir" ]] && { err "未发现部署环境。"; return; }
 
     cd "$workdir" || return
 
-    local redis_env
-    redis_env="$(grep -oP '^REDIS_PASSWORD=\K.*' .env 2>/dev/null || true)"
+    REDIS_PASS="$(grep -oP '^REDIS_PASSWORD=\K.*' .env 2>/dev/null || true)"
+    [[ -n "$REDIS_PASS" ]] && patch_config_yml "$workdir"
 
-    if [[ -n "$redis_env" ]]; then
-        REDIS_PASS="$redis_env"
-        patch_config_yml "$workdir"
-    fi
+    create_nginx_files "$workdir"
+    create_compose_file "$workdir"
 
     compose_run up -d --force-recreate
-    wait_app_ready || true
-    show_access "$workdir"
-}
-
-show_logs() {
-    local workdir
-    workdir="$(get_workdir)"
-
-    [[ -z "$workdir" ]] && {
-        err "未发现部署环境。"
-        return
-    }
-
-    cd "$workdir" || return
-    compose_run ps
-    echo ""
-    compose_run logs --tail=160 api
-}
-
-change_ports() {
-    local workdir
-    workdir="$(get_workdir)"
-
-    [[ -z "$workdir" ]] && {
-        err "未发现部署环境。"
-        return
-    }
-
-    cd "$workdir" || return
-
-    local old_api old_user old_admin old_user_bind old_admin_bind
-    old_api="$(grep -oP '^API_PORT=\K.*' .env || echo "$DEFAULT_API_PORT")"
-    old_user="$(grep -oP '^USER_PORT=\K.*' .env || echo "$DEFAULT_USER_PORT")"
-    old_admin="$(grep -oP '^ADMIN_PORT=\K.*' .env || echo "$DEFAULT_ADMIN_PORT")"
-    old_user_bind="$(grep -oP '^USER_BIND_IP=\K.*' .env || echo "127.0.0.1")"
-    old_admin_bind="$(grep -oP '^ADMIN_BIND_IP=\K.*' .env || echo "127.0.0.1")"
-
-    read -r -p "API 本机端口 [当前: ${old_api}]: " new_api
-    new_api="${new_api:-$old_api}"
-    valid_port "$new_api" || die "API 端口非法。"
-
-    read -r -p "前台端口 [当前: ${old_user}]: " new_user
-    new_user="${new_user:-$old_user}"
-    valid_port "$new_user" || die "前台端口非法。"
-
-    read -r -p "后台端口 [当前: ${old_admin}]: " new_admin
-    new_admin="${new_admin:-$old_admin}"
-    valid_port "$new_admin" || die "后台端口非法。"
-
-    local new_user_bind="$old_user_bind"
-    local new_admin_bind="$old_admin_bind"
-
-    read -r -p "前台公网监听？输入 y 公网 / n 本机 / 回车不变: " pub_user
-    if [[ "$pub_user" =~ ^[Yy]$ ]]; then
-        new_user_bind="0.0.0.0"
-    elif [[ "$pub_user" =~ ^[Nn]$ ]]; then
-        new_user_bind="127.0.0.1"
-    fi
-
-    read -r -p "后台公网监听？输入 y 公网 / n 本机 / 回车不变: " pub_admin
-    if [[ "$pub_admin" =~ ^[Yy]$ ]]; then
-        new_admin_bind="0.0.0.0"
-    elif [[ "$pub_admin" =~ ^[Nn]$ ]]; then
-        new_admin_bind="127.0.0.1"
-    fi
-
-    sed -i "s/^API_PORT=.*/API_PORT=${new_api}/" .env
-    sed -i "s/^USER_PORT=.*/USER_PORT=${new_user}/" .env
-    sed -i "s/^ADMIN_PORT=.*/ADMIN_PORT=${new_admin}/" .env
-    sed -i "s/^USER_BIND_IP=.*/USER_BIND_IP=${new_user_bind}/" .env
-    sed -i "s/^ADMIN_BIND_IP=.*/ADMIN_BIND_IP=${new_admin_bind}/" .env
-
-    compose_run up -d --force-recreate
-    show_access "$workdir"
-}
-
-fix_redis_config() {
-    local workdir
-    workdir="$(get_workdir)"
-
-    [[ -z "$workdir" ]] && {
-        err "未发现部署环境。"
-        return
-    }
-
-    cd "$workdir" || return
-
-    local redis_env
-    redis_env="$(grep -oP '^REDIS_PASSWORD=\K.*' .env 2>/dev/null || true)"
-
-    [[ -z "$redis_env" ]] && die ".env 中找不到 REDIS_PASSWORD。"
-
-    REDIS_PASS="$redis_env"
-    patch_config_yml "$workdir"
-
-    compose_run down --remove-orphans
-    compose_run up -d --force-recreate
-
     wait_app_ready || true
     show_access "$workdir"
 }
@@ -539,11 +523,7 @@ fix_redis_config() {
 do_backup() {
     local workdir
     workdir="$(get_workdir)"
-
-    [[ -z "$workdir" ]] && {
-        err "未找到部署环境。"
-        return
-    }
+    [[ -z "$workdir" ]] && { err "未找到部署环境。"; return; }
 
     local backup_dir="${workdir}/backups"
     mkdir -p "$backup_dir"
@@ -557,6 +537,7 @@ do_backup() {
     cp "${workdir}/${COMPOSE_FILE}" "${temp_dir}/" 2>/dev/null || true
     cp "${workdir}/.env" "${temp_dir}/" 2>/dev/null || true
     [[ -d "${workdir}/config" ]] && cp -r "${workdir}/config" "${temp_dir}/config"
+    [[ -d "${workdir}/nginx" ]] && cp -r "${workdir}/nginx" "${temp_dir}/nginx"
     [[ -d "${workdir}/data" ]] && cp -r "${workdir}/data" "${temp_dir}/data"
 
     local backup_file="${backup_dir}/dujiaonext_backup_${timestamp}.tar.gz"
@@ -570,28 +551,138 @@ do_backup() {
     info "备份完成: ${backup_file}"
 }
 
-uninstall_service() {
+restore_backup() {
     local workdir
     workdir="$(get_workdir)"
 
+    local search_dir="${workdir:-$DEFAULT_INSTALL_PATH}/backups"
+    local default_backup
+    default_backup="$(ls -t "${search_dir}"/dujiaonext_backup_*.tar.gz 2>/dev/null | head -n 1 || true)"
+
+    read -r -p "输入备份文件路径 [回车使用最新备份: ${default_backup}]: " backup_path
+    local path="${backup_path:-$default_backup}"
+
+    [[ ! -f "$path" ]] && {
+        err "备份文件不存在。"
+        return
+    }
+
+    read -r -p "恢复目标目录 [回车默认: $DEFAULT_INSTALL_PATH]: " target_dir
+    local wd="${target_dir:-$DEFAULT_INSTALL_PATH}"
+
+    if [[ -d "$wd" ]]; then
+        read -r -p "目标目录已存在，是否删除并恢复？(y/N): " confirm
+        [[ ! "$confirm" =~ ^[Yy]$ ]] && return
+
+        cd "$wd" 2>/dev/null && {
+            docker compose --env-file .env -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
+            docker-compose --env-file .env -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
+        }
+        cd /
+        rm -rf "$wd"
+    fi
+
+    mkdir -p "$wd"
+    tar -xzf "$path" -C "$wd" || die "解压备份失败。"
+
+    echo "$wd" > "$ENV_RECORD_FILE"
+
+    cd "$wd" || return
+
+    chmod -R 0777 data 2>/dev/null || true
+
+    REDIS_PASS="$(grep -oP '^REDIS_PASSWORD=\K.*' .env 2>/dev/null || true)"
+    [[ -n "$REDIS_PASS" ]] && patch_config_yml "$wd"
+
+    create_nginx_files "$wd"
+    create_compose_file "$wd"
+
+    compose_run up -d --force-recreate || die "恢复后启动失败。"
+
+    wait_app_ready || true
+    show_access "$wd"
+}
+
+setup_auto_backup() {
+    require_cmd crontab
+
+    local workdir
+    workdir="$(get_workdir)"
+
+    [[ -z "$workdir" ]] && {
+        err "环境未部署。"
+        return
+    }
+
+    local cron_script="${workdir}/cron_backup.sh"
+    local script_path
+    script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+
+    echo " 1) 每隔 N 分钟备份"
+    echo " 2) 每天固定时间备份"
+    echo " 3) 删除定时备份"
+
+    read -r -p "请选择 [1/2/3]: " cron_type
+    local cron_spec=""
+
+    case "$cron_type" in
+        1)
+            read -r -p "输入间隔分钟数，例如 10/15/20/30/60: " min_interval
+            [[ "$min_interval" =~ ^[0-9]+$ ]] || { err "分钟数非法。"; return; }
+            cron_spec="*/${min_interval} * * * *"
+        ;;
+        2)
+            read -r -p "输入时间，例如 04:30: " cron_time
+            local hour="${cron_time%:*}"
+            local minute="${cron_time#*:}"
+            [[ "$hour" =~ ^[0-9]+$ && "$minute" =~ ^[0-9]+$ ]] || { err "时间格式错误。"; return; }
+            cron_spec="${minute} ${hour} * * *"
+        ;;
+        3)
+            crontab -l 2>/dev/null | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d" | crontab - 2>/dev/null || true
+            rm -f "$cron_script"
+            info "定时备份已删除。"
+            return
+        ;;
+        *)
+            err "选择无效。"
+            return
+        ;;
+    esac
+
+    cat > "$cron_script" <<EOF
+#!/usr/bin/env bash
+bash "$script_path" run-backup >> "$BACKUP_LOG" 2>&1
+EOF
+
+    chmod +x "$cron_script"
+
+    (
+        crontab -l 2>/dev/null | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d"
+        echo "$CRON_TAG_BEGIN"
+        echo "${cron_spec} bash ${cron_script}"
+        echo "$CRON_TAG_END"
+    ) | crontab -
+
+    info "定时备份已设置。"
+}
+
+uninstall_service() {
+    local workdir
+    workdir="$(get_workdir)"
     [[ -z "$workdir" ]] && workdir="$DEFAULT_INSTALL_PATH"
 
     echo -e "\033[31m⚠️ 警告：这会停止服务，并删除 Dujiao-Next 本地数据！\033[0m"
     read -r -p "确认完全卸载？请输入 y: " confirm
-    [[ ! "$confirm" =~ ^[Yy]$ ]] && {
-        warn "已取消卸载。"
-        return
-    }
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && { warn "已取消卸载。"; return; }
 
     info "停止 compose 服务..."
 
-    if [[ -d "$workdir" ]]; then
-        if [[ -f "$workdir/$COMPOSE_FILE" ]]; then
-            cd "$workdir" 2>/dev/null && {
-                docker compose --env-file .env -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
-                docker-compose --env-file .env -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
-            }
-        fi
+    if [[ -d "$workdir" && -f "$workdir/$COMPOSE_FILE" ]]; then
+        cd "$workdir" 2>/dev/null && {
+            docker compose --env-file .env -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
+            docker-compose --env-file .env -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
+        }
     fi
 
     info "删除相关容器..."
@@ -600,6 +691,8 @@ uninstall_service() {
         "$USER_CONTAINER" \
         "$ADMIN_CONTAINER" \
         "$REDIS_CONTAINER" \
+        "$USER_GATEWAY_CONTAINER" \
+        "$ADMIN_GATEWAY_CONTAINER" \
         dujiao_next \
         dujiao-next \
         2>/dev/null || true
@@ -627,10 +720,62 @@ uninstall_service() {
         | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d" \
         | crontab - 2>/dev/null || true
 
-    info "清理悬空资源..."
     docker system prune -f >/dev/null 2>&1 || true
 
     info "卸载完成。"
+}
+
+install_ftp() {
+    clear
+    echo -e "\033[32m📂 FTP/SFTP 备份工具加载中...\033[0m"
+    bash <(curl -fsSL https://raw.githubusercontent.com/hiapb/ftp/main/back.sh | sed 's/\r$//')
+    sleep 2
+    exit 0
+}
+
+reset_admin_password() {
+    local workdir
+    workdir="$(get_workdir)"
+
+    [[ -z "$workdir" ]] && {
+        err "未发现部署环境。"
+        return
+    }
+
+    cd "$workdir" || return
+
+    local new_pass
+    new_pass="$(openssl rand -hex 16)"
+
+    sed -i "s/^DJ_DEFAULT_ADMIN_PASSWORD=.*/DJ_DEFAULT_ADMIN_PASSWORD=${new_pass}/" .env
+
+    ADMIN_PASS="$new_pass"
+    REDIS_PASS="$(grep -oP '^REDIS_PASSWORD=\K.*' .env 2>/dev/null || true)"
+
+    write_pwd_file "$workdir"
+
+    warn "注意：默认后台密码通常只在首次初始化管理员时生效。"
+    compose_run up -d --force-recreate
+    show_access "$workdir"
+}
+
+show_logs() {
+    local workdir
+    workdir="$(get_workdir)"
+
+    [[ -z "$workdir" ]] && {
+        err "未发现部署环境。"
+        return
+    }
+
+    cd "$workdir" || return
+    compose_run ps
+    echo ""
+    compose_run logs --tail=160 api
+    echo ""
+    compose_run logs --tail=80 user-gateway
+    echo ""
+    compose_run logs --tail=80 admin-gateway
 }
 
 main_menu() {
@@ -649,14 +794,16 @@ main_menu() {
     echo "  3) 停止服务"
     echo "  4) 重启服务"
     echo "  5) 手动备份"
-    echo "  6) 修复 Redis 配置/NOAUTH"
-    echo "  7) 查看状态和 API 日志"
+    echo "  6) 恢复备份"
+    echo "  7) 定时备份"
     echo "  8) 完全卸载"
-    echo "  9) 修改端口/公网监听"
+    echo "  9) FTP/SFTP 备份工具"
+    echo " 10) 重置后台密码"
+    echo " 11) 查看状态和日志"
     echo "  0) 退出"
     echo "==================================================="
 
-    read -r -p "请输入选项 [0-9]: " choice
+    read -r -p "请输入选项 [0-11]: " choice
 
     case "$choice" in
         1) deploy_dujiao_next ;;
@@ -664,10 +811,12 @@ main_menu() {
         3) pause_service ;;
         4) restart_service ;;
         5) do_backup ;;
-        6) fix_redis_config ;;
-        7) show_logs ;;
+        6) restore_backup ;;
+        7) setup_auto_backup ;;
         8) uninstall_service ;;
-        9) change_ports ;;
+        9) install_ftp ;;
+        10) reset_admin_password ;;
+        11) show_logs ;;
         0) info "已退出。"; exit 0 ;;
         *) warn "无效选项。" ;;
     esac
