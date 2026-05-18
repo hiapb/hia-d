@@ -743,85 +743,136 @@ manage_goods_sold_count() {
 
     ensure_sqlite3
 
-    local db_file
-    db_file="$(find "$workdir/data/db" -type f \( -name "*.db" -o -name "*.sqlite" -o -name "*.sqlite3" \) 2>/dev/null | head -n 1)"
+    local db_file="${workdir}/data/db/dujiao.db"
 
-    [[ -z "$db_file" || ! -f "$db_file" ]] && {
-        err "未找到 SQLite 数据库文件。"
+    [[ ! -f "$db_file" ]] && {
+        err "未找到数据库文件: $db_file"
         return
     }
 
     info "数据库文件: $db_file"
 
-    local goods_table="goods"
-    local sold_col="manual_stock_sold"
-    local category_col="category_id"
-
-    local name_expr
-    name_expr="COALESCE(NULLIF(json_extract(title_json, '\$.zh-CN'), ''), NULLIF(json_extract(title_json, '\$.zh-TW'), ''), NULLIF(json_extract(title_json, '\$.en-US'), ''), title_json)"
-
     echo ""
     echo "==================================================="
     echo "              修改商品已售数量"
     echo "==================================================="
+    echo ""
 
     echo "分类列表："
     echo "---------------------------------------------------"
     sqlite3 -header -column "$db_file" "
-        SELECT DISTINCT $category_col AS 分类ID
-        FROM $goods_table
-        ORDER BY $category_col ASC;
+        SELECT
+            id AS 分类ID,
+            COALESCE(
+                NULLIF(json_extract(name_json, '$.zh-CN'), ''),
+                NULLIF(json_extract(name_json, '$.zh-TW'), ''),
+                NULLIF(json_extract(name_json, '$.en-US'), ''),
+                name_json
+            ) AS 分类名称
+        FROM categories
+        ORDER BY sort_order ASC, id ASC;
     "
     echo "---------------------------------------------------"
 
-    read -r -p "请输入分类ID: " selected_category
+    read -r -p "请输入分类ID: " category_id
 
-    [[ ! "$selected_category" =~ ^[0-9]+$ ]] && {
+    [[ ! "$category_id" =~ ^[0-9]+$ ]] && {
         err "分类ID非法。"
+        return
+    }
+
+    local category_exists
+    category_exists="$(sqlite3 "$db_file" "SELECT COUNT(*) FROM categories WHERE id=$category_id;")"
+
+    [[ "$category_exists" != "1" ]] && {
+        err "分类不存在。"
         return
     }
 
     echo ""
     echo "商品列表："
     echo "---------------------------------------------------"
+
     sqlite3 -header -column "$db_file" "
         SELECT
-            id AS 商品ID,
-            $name_expr AS 商品名称,
-            manual_stock_total AS 库存总数,
-            manual_stock_locked AS 锁定数量,
-            $sold_col AS 已售数量
-        FROM $goods_table
-        WHERE $category_col=$selected_category
-        ORDER BY id ASC;
+            p.id AS 商品ID,
+            COALESCE(
+                NULLIF(json_extract(p.title_json, '$.zh-CN'), ''),
+                NULLIF(json_extract(p.title_json, '$.zh-TW'), ''),
+                NULLIF(json_extract(p.title_json, '$.en-US'), ''),
+                p.title_json
+            ) AS 商品名称,
+            p.manual_stock_total AS 商品库存,
+            p.manual_stock_locked AS 商品锁定,
+            p.manual_stock_sold AS 商品已售,
+            COALESCE(SUM(s.manual_stock_total), 0) AS SKU库存,
+            COALESCE(SUM(s.manual_stock_locked), 0) AS SKU锁定,
+            COALESCE(SUM(s.manual_stock_sold), 0) AS SKU已售
+        FROM products p
+        LEFT JOIN product_skus s ON s.product_id = p.id AND s.deleted_at IS NULL
+        WHERE p.category_id=$category_id
+          AND p.deleted_at IS NULL
+        GROUP BY p.id
+        ORDER BY p.sort_order ASC, p.id ASC;
     "
+
     echo "---------------------------------------------------"
 
-    read -r -p "请输入要修改的商品ID: " goods_id
+    read -r -p "请输入要修改的商品ID: " product_id
 
-    [[ ! "$goods_id" =~ ^[0-9]+$ ]] && {
+    [[ ! "$product_id" =~ ^[0-9]+$ ]] && {
         err "商品ID非法。"
         return
     }
 
-    local exists
-    exists="$(sqlite3 "$db_file" "SELECT COUNT(*) FROM $goods_table WHERE id=$goods_id AND $category_col=$selected_category;")"
+    local product_exists
+    product_exists="$(sqlite3 "$db_file" "SELECT COUNT(*) FROM products WHERE id=$product_id AND category_id=$category_id AND deleted_at IS NULL;")"
 
-    [[ "$exists" != "1" ]] && {
-        err "商品不存在。"
+    [[ "$product_exists" != "1" ]] && {
+        err "商品不存在或不属于该分类。"
         return
     }
 
+    echo ""
+    echo "当前商品信息："
+    echo "---------------------------------------------------"
     sqlite3 -header -column "$db_file" "
         SELECT
-            id AS 商品ID,
-            $name_expr AS 商品名称,
-            manual_stock_total AS 库存总数,
-            manual_stock_locked AS 锁定数量,
-            $sold_col AS 当前已售
-        FROM $goods_table
-        WHERE id=$goods_id;
+            p.id AS 商品ID,
+            COALESCE(
+                NULLIF(json_extract(p.title_json, '$.zh-CN'), ''),
+                NULLIF(json_extract(p.title_json, '$.zh-TW'), ''),
+                NULLIF(json_extract(p.title_json, '$.en-US'), ''),
+                p.title_json
+            ) AS 商品名称,
+            p.manual_stock_total AS 商品库存,
+            p.manual_stock_locked AS 商品锁定,
+            p.manual_stock_sold AS 商品已售,
+            COALESCE(SUM(s.manual_stock_total), 0) AS SKU库存,
+            COALESCE(SUM(s.manual_stock_locked), 0) AS SKU锁定,
+            COALESCE(SUM(s.manual_stock_sold), 0) AS SKU已售
+        FROM products p
+        LEFT JOIN product_skus s ON s.product_id = p.id AND s.deleted_at IS NULL
+        WHERE p.id=$product_id
+        GROUP BY p.id;
     "
+
+    echo ""
+    echo "该商品 SKU 列表："
+    echo "---------------------------------------------------"
+    sqlite3 -header -column "$db_file" "
+        SELECT
+            id AS SKU_ID,
+            sku_code AS SKU编码,
+            manual_stock_total AS 库存,
+            manual_stock_locked AS 锁定,
+            manual_stock_sold AS 已售
+        FROM product_skus
+        WHERE product_id=$product_id
+          AND deleted_at IS NULL
+        ORDER BY sort_order ASC, id ASC;
+    "
+    echo "---------------------------------------------------"
 
     read -r -p "请输入新的已售数量: " new_sold
 
@@ -830,12 +881,32 @@ manage_goods_sold_count() {
         return
     }
 
+    echo ""
+    echo "你将把商品 ID ${product_id} 的已售数量改为: ${new_sold}"
+    read -r -p "确认修改？(y/N): " confirm
+
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && {
+        warn "已取消修改。"
+        return
+    }
+
     sqlite3 "$db_file" "
-        UPDATE $goods_table
+        BEGIN;
+
+        UPDATE products
         SET
-            $sold_col=$new_sold,
+            manual_stock_sold=$new_sold,
             updated_at=datetime('now')
-        WHERE id=$goods_id;
+        WHERE id=$product_id;
+
+        UPDATE product_skus
+        SET
+            manual_stock_sold=$new_sold,
+            updated_at=datetime('now')
+        WHERE product_id=$product_id
+          AND deleted_at IS NULL;
+
+        COMMIT;
     " || {
         err "修改失败。"
         return
@@ -857,21 +928,32 @@ manage_goods_sold_count() {
     info "修改完成。"
 
     echo ""
+    echo "修改后商品信息："
+    echo "---------------------------------------------------"
     sqlite3 -header -column "$db_file" "
         SELECT
-            id AS 商品ID,
-            $name_expr AS 商品名称,
-            manual_stock_total AS 库存总数,
-            manual_stock_locked AS 锁定数量,
-            $sold_col AS 已售数量
-        FROM $goods_table
-        WHERE id=$goods_id;
+            p.id AS 商品ID,
+            COALESCE(
+                NULLIF(json_extract(p.title_json, '$.zh-CN'), ''),
+                NULLIF(json_extract(p.title_json, '$.zh-TW'), ''),
+                NULLIF(json_extract(p.title_json, '$.en-US'), ''),
+                p.title_json
+            ) AS 商品名称,
+            p.manual_stock_total AS 商品库存,
+            p.manual_stock_locked AS 商品锁定,
+            p.manual_stock_sold AS 商品已售,
+            COALESCE(SUM(s.manual_stock_total), 0) AS SKU库存,
+            COALESCE(SUM(s.manual_stock_locked), 0) AS SKU锁定,
+            COALESCE(SUM(s.manual_stock_sold), 0) AS SKU已售
+        FROM products p
+        LEFT JOIN product_skus s ON s.product_id = p.id AND s.deleted_at IS NULL
+        WHERE p.id=$product_id
+        GROUP BY p.id;
     "
 
-    echo ""
-    warn "浏览器后台页面请 Ctrl + F5 强制刷新。"
+    echo "---------------------------------------------------"
+    warn "后台页面请 Ctrl + F5 强制刷新。"
 }
-
 uninstall_service() {
     local workdir
     workdir="$(get_workdir)"
