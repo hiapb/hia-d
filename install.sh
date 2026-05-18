@@ -477,7 +477,7 @@ install_ftp() {
 main_menu() {
     clear
     echo "==================================================="
-    echo "               Dujiao-Next 深度控制终端            "
+    echo "               Dujiao-Next 一键管理                "
     echo "==================================================="
     local wd
     wd=$(get_workdir)
