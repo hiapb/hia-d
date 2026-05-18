@@ -765,7 +765,7 @@ manage_goods_sold_count() {
     }
 
     local sold_col=""
-    for col in sold_count sold sales sales_count sold_num volume sales_volume; do
+    for col in manual_stock_sold sold_count sold sales sales_count sold_num volume sales_volume; do
         if sqlite3 "$db_file" "PRAGMA table_info($goods_table);" | awk -F'|' '{print $2}' | grep -qx "$col"; then
             sold_col="$col"
             break
@@ -780,7 +780,7 @@ manage_goods_sold_count() {
     }
 
     local name_col=""
-    for col in name title goods_name product_name; do
+    for col in title_json name title goods_name product_name; do
         if sqlite3 "$db_file" "PRAGMA table_info($goods_table);" | awk -F'|' '{print $2}' | grep -qx "$col"; then
             name_col="$col"
             break
