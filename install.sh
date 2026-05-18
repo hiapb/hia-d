@@ -447,7 +447,7 @@ uninstall_service() {
 install_ftp() {
     clear
     echo -e "\033[32m📂 异地容灾 FTP/SFTP 并行备份管道加载中...\033[0m"
-    bash <(curl -L https://raw.githubusercontent.com/hiapb/ftp/main/back.sh)
+    bash <(curl -fsSL https://raw.githubusercontent.com/hiapb/ftp/main/back.sh | sed 's/\r$//')
     sleep 2
     exit 0
 }
@@ -504,4 +504,3 @@ else
         read -r -p "➤ 按下回车键重置至主控层..."
     done
 fi
-EOF
