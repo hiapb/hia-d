@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ==========================================
-# Dujiao-Next 自动化运维矩阵 (纯净版)
+# Dujiao-Next 
 # ==========================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
@@ -455,7 +455,7 @@ install_ftp() {
 main_menu() {
     clear
     echo "==================================================="
-    echo "               Dujiao-Next 深度控制终端            "
+    echo "               Dujiao-Next 一键管理                "
     echo "==================================================="
     local wd
     wd=$(get_workdir)
