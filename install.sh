@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 
 # ==========================================
-# Dujiao-Next 
+# Dujiao-Next
 # ==========================================
+
+set -o pipefail
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
@@ -16,7 +18,6 @@ BACKUP_LOG="/var/log/dujiaonext_backup.log"
 CONTAINER_NAME="dujiao_next"
 IMAGE_NAME="ghcr.io/apernet/dujiao-next:latest"
 
-# 规避常见扫描器
 DEFAULT_HOST_PORT="34567"
 
 ADMIN_PASS=""
@@ -26,10 +27,12 @@ warn() { echo -e "\033[33m[WARN]\033[0m $1" >&2; }
 err()  { echo -e "\033[31m[ERROR]\033[0m $1" >&2; }
 die()  { echo -e "\033[31m[FATAL]\033[0m $1" >&2; exit 1; }
 
-require_cmd() { command -v "$1" >/dev/null 2>&1 || die "系统缺少核心依赖: $1"; }
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "系统缺少依赖: $1"
+}
 
 get_local_ip() {
-    hostname -I | awk '{print $1}' || echo "127.0.0.1"
+    hostname -I 2>/dev/null | awk '{print $1}'
 }
 
 valid_port() {
@@ -43,7 +46,7 @@ docker_compose_cmd() {
     elif docker compose version >/dev/null 2>&1; then
         echo "docker compose"
     else
-        die "未探测到 Docker Compose 引擎，请先安装 Docker。"
+        die "未检测到 Docker Compose，请先安装 Docker / Docker Compose。"
     fi
 }
 
@@ -52,7 +55,7 @@ get_workdir() {
 }
 
 generate_admin_password() {
-    ADMIN_PASS=$(openssl rand -hex 16)
+    ADMIN_PASS="$(openssl rand -hex 16)"
 }
 
 write_pwd_file() {
@@ -76,14 +79,14 @@ show_access() {
     local env_file="${workdir}/.env"
 
     local host_port
-    host_port=$(grep -oP '^PORT=\K.*' "$env_file" 2>/dev/null || echo "$DEFAULT_HOST_PORT")
+    host_port="$(grep -oP '^PORT=\K.*' "$env_file" 2>/dev/null || echo "$DEFAULT_HOST_PORT")"
 
     local current_pass
-    current_pass=$(read_pwd_file "$workdir")
+    current_pass="$(read_pwd_file "$workdir")"
 
     echo ""
     echo "=================================================="
-    echo -e "\033[32m✅ Dujiao-Next 商业实例已就绪\033[0m"
+    echo -e "\033[32m✅ Dujiao-Next 实例已就绪\033[0m"
     echo "--------------------------------------------------"
     echo -e "Web 控制台: \033[36mhttp://$(get_local_ip):${host_port}\033[0m"
     echo "--------------------------------------------------"
@@ -91,24 +94,24 @@ show_access() {
     echo -e "密码存储路径: \033[33m${workdir}/configs/pwd\033[0m"
     echo -e "核心数据目录: \033[33m${workdir}/configs\033[0m"
     echo "--------------------------------------------------"
-    echo "网络映射逻辑:"
-    echo "  公网/网关: ${host_port} 穿透至容器层 3000"
+    echo "网络映射:"
+    echo "  主机端口 ${host_port} -> 容器端口 3000"
     echo "=================================================="
     echo ""
 }
 
 wait_app_ready() {
-    info "监听 Dujiao-Next 进程初始化心跳..."
+    info "等待 Dujiao-Next 容器启动..."
 
     for i in {1..60}; do
         if docker ps --format '{{.Names}} {{.Status}}' | grep -q "^${CONTAINER_NAME} .*Up"; then
-            info "容器存活确认。服务已接管。"
+            info "容器已启动。"
             return 0
         fi
         sleep 2
     done
 
-    warn "服务可能遭遇 CrashLoopBackOff 状态，请检查日志。"
+    warn "服务可能未正常启动，请检查日志："
     docker logs --tail=100 "$CONTAINER_NAME" 2>/dev/null || true
     return 1
 }
@@ -134,7 +137,7 @@ DOCKEREOF
 }
 
 deploy_dujiao_next() {
-    info "== 启动 Dujiao-Next 工业级编排 =="
+    info "开始部署 Dujiao-Next..."
 
     require_cmd docker
     require_cmd curl
@@ -143,13 +146,13 @@ deploy_dujiao_next() {
     require_cmd openssl
 
     local dc_cmd
-    dc_cmd=$(docker_compose_cmd)
+    dc_cmd="$(docker_compose_cmd)"
 
-    read -r -p "规划物理落盘路径 [回车默认: $DEFAULT_INSTALL_PATH]: " input_path
-    local install_path=${input_path:-$DEFAULT_INSTALL_PATH}
+    read -r -p "安装路径 [回车默认: $DEFAULT_INSTALL_PATH]: " input_path
+    local install_path="${input_path:-$DEFAULT_INSTALL_PATH}"
 
     if [[ -d "$install_path" && "$(ls -A "$install_path" 2>/dev/null)" ]]; then
-        err "目标向量域已存在污染数据，请先执行 [8] 进行物理擦除。"
+        err "目标目录已存在且非空，请先执行 [8] 完全卸载，或换一个目录。"
         return
     fi
 
@@ -158,13 +161,13 @@ deploy_dujiao_next() {
 
     cd "$install_path" || return
 
-    read -r -p "设定前端入口端口 [回车默认: $DEFAULT_HOST_PORT]: " input_port
-    local host_port=${input_port:-$DEFAULT_HOST_PORT}
+    read -r -p "访问端口 [回车默认: $DEFAULT_HOST_PORT]: " input_port
+    local host_port="${input_port:-$DEFAULT_HOST_PORT}"
 
-    valid_port "$host_port" || die "端口阈值溢出或非法，仅限 1-65535"
+    valid_port "$host_port" || die "端口非法，只允许 1-65535。"
 
     mkdir -p configs data backups
-    chmod -R 777 backups data
+    chmod -R 755 backups data
 
     generate_admin_password
     write_pwd_file "$install_path"
@@ -176,10 +179,10 @@ ENVEFF
 
     create_compose_file "$install_path"
 
-    info "下发镜像拉取指令并构建运行态..."
+    info "拉取镜像并启动服务..."
 
-    $dc_cmd pull || warn "镜像中心响应超时，尝试冷启动..."
-    $dc_cmd up -d || die "守护进程唤醒失败，请检查 Docker Daemon。"
+    $dc_cmd pull || warn "镜像拉取失败，将尝试直接启动。"
+    $dc_cmd up -d || die "服务启动失败，请检查 Docker。"
 
     wait_app_ready || true
     show_access "$install_path"
@@ -187,22 +190,22 @@ ENVEFF
 
 upgrade_service() {
     local workdir
-    workdir=$(get_workdir)
+    workdir="$(get_workdir)"
 
     [[ -z "$workdir" ]] && {
-        err "内存映射未命中，环境尚未部署。"
+        err "未找到部署记录，环境尚未部署。"
         return
     }
 
     cd "$workdir" || return
 
     local dc_cmd
-    dc_cmd=$(docker_compose_cmd)
+    dc_cmd="$(docker_compose_cmd)"
 
-    info "执行无缝轮转更新逻辑..."
+    info "开始升级服务..."
 
-    $dc_cmd pull || die "镜像层同步断裂"
-    $dc_cmd up -d || die "服务重建失败"
+    $dc_cmd pull || die "镜像拉取失败。"
+    $dc_cmd up -d || die "服务重建失败。"
 
     wait_app_ready || true
     show_access "$workdir"
@@ -210,23 +213,24 @@ upgrade_service() {
 
 pause_service() {
     local workdir
-    workdir=$(get_workdir)
+    workdir="$(get_workdir)"
 
     [[ -z "$workdir" ]] && {
-        err "未发现活动态实例。"
+        err "未发现活动实例。"
         return
     }
 
-    cd "$workdir" && $(docker_compose_cmd) stop
-    info "资源已冻结，服务暂停挂起。"
+    cd "$workdir" || return
+    $(docker_compose_cmd) stop
+    info "服务已停止。"
 }
 
 restart_service() {
     local workdir
-    workdir=$(get_workdir)
+    workdir="$(get_workdir)"
 
     [[ -z "$workdir" ]] && {
-        err "环境游离缺失。"
+        err "未找到部署环境。"
         return
     }
 
@@ -238,10 +242,10 @@ restart_service() {
 
 reset_admin_password() {
     local workdir
-    workdir=$(get_workdir)
+    workdir="$(get_workdir)"
 
     [[ -z "$workdir" ]] && {
-        err "无法定位配置文件域。"
+        err "无法定位配置目录。"
         return
     }
 
@@ -251,16 +255,16 @@ reset_admin_password() {
     cd "$workdir" || return
     $(docker_compose_cmd) restart "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
-    info "密码字典已被覆写更新。"
+    info "后台密码已重置。"
     show_access "$workdir"
 }
 
 do_backup() {
     local workdir
-    workdir=$(get_workdir)
+    workdir="$(get_workdir)"
 
     [[ -z "$workdir" ]] && {
-        err "目标备份域为空。"
+        err "未找到备份目标。"
         return
     }
 
@@ -268,7 +272,7 @@ do_backup() {
     mkdir -p "$backup_dir"
 
     local timestamp
-    timestamp=$(date +"%Y%m%d_%H%M%S")
+    timestamp="$(date +"%Y%m%d_%H%M%S")"
 
     local temp_dir="${backup_dir}/tmp_${timestamp}"
     mkdir -p "$temp_dir"
@@ -286,33 +290,33 @@ do_backup() {
     cd "$backup_dir" || return
     ls -t dujiaonext_backup_*.tar.gz 2>/dev/null | awk 'NR>5' | xargs -r rm -f
 
-    info "快照已固化至: ${backup_file}"
+    info "备份已完成: ${backup_file}"
 }
 
 restore_backup() {
     local workdir
-    workdir=$(get_workdir)
+    workdir="$(get_workdir)"
 
     local search_dir="${workdir:-$DEFAULT_INSTALL_PATH}/backups"
     local default_backup
-    default_backup=$(ls -t "${search_dir}"/dujiaonext_backup_*.tar.gz 2>/dev/null | head -n 1 || true)
+    default_backup="$(ls -t "${search_dir}"/dujiaonext_backup_*.tar.gz 2>/dev/null | head -n 1 || true)"
 
-    read -r -p "输入重载源路径 [回车使用最新切片: ${default_backup}]: " backup_path
-    local path=${backup_path:-$default_backup}
+    read -r -p "输入备份文件路径 [回车使用最新备份: ${default_backup}]: " backup_path
+    local path="${backup_path:-$default_backup}"
 
     [[ ! -f "$path" ]] && {
-        err "块文件损坏或不存在。"
+        err "备份文件不存在。"
         return
     }
 
     local safe_backup="/tmp/$(basename "$path")"
-    cp "$path" "$safe_backup" || die "沙盒隔离失败"
+    cp "$path" "$safe_backup" || die "复制备份文件失败。"
 
-    read -r -p "指定恢复靶区 [回车默认: $DEFAULT_INSTALL_PATH]: " target_dir
-    local wd=${target_dir:-$DEFAULT_INSTALL_PATH}
+    read -r -p "恢复目标目录 [回车默认: $DEFAULT_INSTALL_PATH]: " target_dir
+    local wd="${target_dir:-$DEFAULT_INSTALL_PATH}"
 
     if [[ -d "$wd" ]]; then
-        read -r -p "侦测到靶区存在残存活动，是否强制抹除？(y/N): " confirm
+        read -r -p "目标目录已存在，是否删除并恢复？(y/N): " confirm
 
         [[ ! "$confirm" =~ ^[Yy]$ ]] && {
             rm -f "$safe_backup"
@@ -326,7 +330,7 @@ restore_backup() {
     fi
 
     mkdir -p "$wd"
-    tar -xzf "$safe_backup" -C "$wd" || die "算法层解压崩解"
+    tar -xzf "$safe_backup" -C "$wd" || die "解压备份失败。"
 
     mkdir -p "${wd}/backups"
     cp "$safe_backup" "${wd}/backups/$(basename "$safe_backup")" 2>/dev/null || true
@@ -336,9 +340,10 @@ restore_backup() {
 
     cd "$wd" || return
     mkdir -p configs data backups
-    chmod -R 777 backups data 2>/dev/null || true
+    chmod -R 755 backups data 2>/dev/null || true
 
     [[ ! -f "${wd}/docker-compose.yml" ]] && create_compose_file "$wd"
+
     if [[ ! -f "${wd}/.env" ]]; then
         cat > "${wd}/.env" <<ENVEFF
 PORT=$DEFAULT_HOST_PORT
@@ -351,7 +356,7 @@ ENVEFF
         write_pwd_file "$wd"
     fi
 
-    $(docker_compose_cmd) up -d || die "编排唤醒失败"
+    $(docker_compose_cmd) up -d || die "恢复后启动失败。"
 
     wait_app_ready || true
     show_access "$wd"
@@ -359,42 +364,55 @@ ENVEFF
 
 setup_auto_backup() {
     require_cmd crontab
-    local workdir
-    workdir=$(get_workdir)
 
-    [[ -z "$workdir" ]] && { err "环境未注册。"; return; }
+    local workdir
+    workdir="$(get_workdir)"
+
+    [[ -z "$workdir" ]] && {
+        err "环境未部署。"
+        return
+    }
 
     local cron_script="${workdir}/cron_backup.sh"
     local script_path
     script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 
-    echo " 1) 基于固定分钟步长（推荐策略：10/15/20/30/60）"
-    echo " 2) 基于绝对时间锚点（例如：每日 04:30）"
-    echo " 3) 剥离当前定时轮询机制"
+    echo " 1) 每隔 N 分钟备份"
+    echo " 2) 每天固定时间备份"
+    echo " 3) 删除定时备份"
 
-    read -r -p "下达策略编号 [1/2/3]: " cron_type
+    read -r -p "请选择 [1/2/3]: " cron_type
     local cron_spec=""
 
     case "$cron_type" in
         1)
-            read -r -p "输入步长(分钟): " min_interval
-            [[ "$min_interval" =~ ^[0-9]+$ ]] || { err "非法参数"; return; }
+            read -r -p "输入间隔分钟数，例如 10/15/20/30/60: " min_interval
+            [[ "$min_interval" =~ ^[0-9]+$ ]] || {
+                err "分钟数非法。"
+                return
+            }
             cron_spec="*/${min_interval} * * * *"
         ;;
         2)
-            read -r -p "输入时间锚点 (HH:MM): " cron_time
+            read -r -p "输入时间，例如 04:30: " cron_time
             local hour="${cron_time%:*}"
             local minute="${cron_time#*:}"
-            [[ "$hour" =~ ^[0-9]+$ && "$minute" =~ ^[0-9]+$ ]] || { err "解析失败"; return; }
+            [[ "$hour" =~ ^[0-9]+$ && "$minute" =~ ^[0-9]+$ ]] || {
+                err "时间格式错误。"
+                return
+            }
             cron_spec="${minute} ${hour} * * *"
         ;;
         3)
             crontab -l 2>/dev/null | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d" | crontab - 2>/dev/null || true
             rm -f "$cron_script"
-            info "轮询钩子已卸载。"
+            info "定时备份已删除。"
             return
         ;;
-        *) err "指令越界"; return ;;
+        *)
+            err "选择无效。"
+            return
+        ;;
     esac
 
     cat > "$cron_script" <<CRONEOF
@@ -411,7 +429,7 @@ CRONEOF
         echo "$CRON_TAG_END"
     ) | crontab -
 
-    info "Crond 守护进程已成功挂载新规则。"
+    info "定时备份已设置。"
 }
 
 clean_all_dujiaonext() {
@@ -421,12 +439,12 @@ clean_all_dujiaonext() {
 
 uninstall_service() {
     local workdir
-    workdir=$(get_workdir)
+    workdir="$(get_workdir)"
 
-    [[ -z "$workdir" ]] && workdir=$DEFAULT_INSTALL_PATH
+    [[ -z "$workdir" ]] && workdir="$DEFAULT_INSTALL_PATH"
 
-    echo -e "\033[31m⚠️ 核心警告：这将导致业务全盘宕机并粉碎全部本地卷数据！\033[0m"
-    read -r -p "二次确认指令以授权物理销毁 (y/N): " confirm
+    echo -e "\033[31m⚠️ 警告：这会停止服务并删除本地数据！\033[0m"
+    read -r -p "确认卸载？(y/N): " confirm
     [[ ! "$confirm" =~ ^[Yy]$ ]] && return
 
     if [[ -d "$workdir" ]]; then
@@ -441,12 +459,12 @@ uninstall_service() {
 
     crontab -l 2>/dev/null | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d" | crontab - 2>/dev/null || true
 
-    info "系统已被彻底洗牌，数据已化为比特尘埃。"
+    info "已完全卸载。"
 }
 
 install_ftp() {
     clear
-    echo -e "\033[32m📂 异地容灾 FTP/SFTP 并行备份管道加载中...\033[0m"
+    echo -e "\033[32m📂 FTP/SFTP 备份工具加载中...\033[0m"
     bash <(curl -fsSL https://raw.githubusercontent.com/hiapb/ftp/main/back.sh | sed 's/\r$//')
     sleep 2
     exit 0
@@ -455,11 +473,13 @@ install_ftp() {
 main_menu() {
     clear
     echo "==================================================="
-    echo "               Dujiao-Next 一键管理                "
+    echo "               Dujiao-Next 一键管理"
     echo "==================================================="
+
     local wd
-    wd=$(get_workdir)
-    echo -e " 核心挂载域: \033[36m${wd:-游离态 (未部署)}\033[0m"
+    wd="$(get_workdir)"
+
+    echo -e " 当前安装目录: \033[36m${wd:-未部署}\033[0m"
     echo "---------------------------------------------------"
     echo "  1) 一键部署"
     echo "  2) 升级服务"
@@ -469,11 +489,12 @@ main_menu() {
     echo "  6) 恢复备份"
     echo "  7) 定时备份"
     echo "  8) 完全卸载"
-    echo "  9) 📂 FTP/SFTP 备份工具"
+    echo "  9) FTP/SFTP 备份工具"
     echo " 10) 重置后台密码"
-    echo "  0) 退出终端"
+    echo "  0) 退出"
     echo "==================================================="
-    read -r -p "输入指令信道 [0-10]: " choice
+
+    read -r -p "请输入选项 [0-10]: " choice
 
     case "$choice" in
         1) deploy_dujiao_next ;;
@@ -486,8 +507,8 @@ main_menu() {
         8) uninstall_service ;;
         9) install_ftp ;;
         10) reset_admin_password ;;
-        0) info "通信链路切断。老板，祝您生意兴隆。"; exit 0 ;;
-        *) warn "信道干扰，未能解析指令。" ;;
+        0) info "已退出。"; exit 0 ;;
+        *) warn "无效选项。" ;;
     esac
 }
 
@@ -495,12 +516,12 @@ if [[ "${1:-}" == "run-backup" ]]; then
     do_backup
 else
     if [[ $EUID -ne 0 ]]; then
-        die "权限边界不足：必须提权至 Root 账户方可调动底层资源。"
+        die "请使用 root 用户运行。"
     fi
 
     while true; do
         main_menu
         echo ""
-        read -r -p "➤ 按下回车键重置至主控层..."
+        read -r -p "按回车返回主菜单..."
     done
 fi
