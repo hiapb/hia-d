@@ -6,7 +6,6 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 DEFAULT_INSTALL_PATH="/opt/dujiao-next"
 ENV_RECORD_FILE="/etc/dujiaonext_env"
-
 COMPOSE_FILE="docker-compose.sqlite.yml"
 
 CRON_TAG_BEGIN="# DUJIAO_NEXT_BACKUP_BEGIN"
@@ -71,12 +70,15 @@ generate_passwords() {
 
 write_pwd_file() {
     local workdir="$1"
+
     mkdir -p "${workdir}/config"
+
     {
         echo "后台账号: ${ADMIN_USER}"
         echo "后台密码: ${ADMIN_PASS}"
         echo "Redis密码: ${REDIS_PASS}"
     } > "${workdir}/config/passwords.txt"
+
     chmod 600 "${workdir}/config/passwords.txt"
 }
 
@@ -158,38 +160,6 @@ networks:
 DOCKEREOF
 }
 
-patch_config_yml() {
-    local workdir="$1"
-    local cfg="${workdir}/config/config.yml"
-
-    [[ -f "$cfg" ]] || die "config.yml 不存在。"
-
-    python3 - "$cfg" "$REDIS_PASS" <<'PYEOF'
-import sys, re, secrets, string
-
-path = sys.argv[1]
-redis_pass = sys.argv[2]
-
-text = open(path, "r", encoding="utf-8").read()
-
-text = re.sub(r'(driver:\s*)\w+', r'\1sqlite', text)
-text = re.sub(r'(dsn:\s*).+', r'\1/app/db/dujiao.db', text)
-
-text = re.sub(r'(host:\s*)localhost', r'\1redis', text)
-text = re.sub(r'(host:\s*)127\.0\.0\.1', r'\1redis', text)
-text = re.sub(r'(password:\s*)your-strong-redis-password', r'\1' + redis_pass, text)
-
-alphabet = string.ascii_letters + string.digits
-jwt1 = ''.join(secrets.choice(alphabet) for _ in range(48))
-jwt2 = ''.join(secrets.choice(alphabet) for _ in range(48))
-
-text = re.sub(r'(jwt:\s*\n(?:[^\n]*\n)*?\s*secret:\s*).+', r'\1' + jwt1, text, count=1)
-text = re.sub(r'(user_jwt:\s*\n(?:[^\n]*\n)*?\s*secret:\s*).+', r'\1' + jwt2, text, count=1)
-
-open(path, "w", encoding="utf-8", newline="\n").write(text)
-PYEOF
-}
-
 download_config() {
     local workdir="$1"
     local cfg="${workdir}/config/config.yml"
@@ -201,6 +171,64 @@ download_config() {
 
     curl -fsSL https://raw.githubusercontent.com/dujiao-next/dujiao-next/main/config.yml.example -o "$cfg" \
         || die "下载 config.yml.example 失败。"
+}
+
+patch_config_yml() {
+    local workdir="$1"
+    local cfg="${workdir}/config/config.yml"
+
+    [[ -f "$cfg" ]] || die "config.yml 不存在。"
+
+    python3 - "$cfg" "$REDIS_PASS" <<'PYEOF'
+import sys
+import re
+import secrets
+import string
+
+path = sys.argv[1]
+redis_pass = sys.argv[2]
+
+text = open(path, "r", encoding="utf-8").read()
+
+text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+text = re.sub(r'(?m)^(\s*host:\s*)(127\.0\.0\.1|localhost)\s*$', r'\1redis', text)
+
+if re.search(r'(?m)^redis:\s*$', text):
+    text = re.sub(
+        r'(?ms)^redis:\s*\n(?:^[ \t]+.*\n?)*',
+        f'''redis:
+  host: redis
+  port: 6379
+  password: {redis_pass}
+  db: 0
+''',
+        text,
+        count=1
+    )
+else:
+    text += f'''
+
+redis:
+  host: redis
+  port: 6379
+  password: {redis_pass}
+  db: 0
+'''
+
+text = re.sub(r'(?m)^(\s*driver:\s*)mysql\s*$', r'\1sqlite', text)
+text = re.sub(r'(?m)^(\s*driver:\s*)postgres\s*$', r'\1sqlite', text)
+text = re.sub(r'(?m)^(\s*dsn:\s*).+$', r'\1/app/db/dujiao.db', text)
+
+alphabet = string.ascii_letters + string.digits
+jwt1 = ''.join(secrets.choice(alphabet) for _ in range(48))
+jwt2 = ''.join(secrets.choice(alphabet) for _ in range(48))
+
+text = re.sub(r'(?m)^(\s*secret:\s*)your.*$', r'\1' + jwt1, text, count=1)
+text = re.sub(r'(?m)^(\s*secret:\s*)change.*$', r'\1' + jwt2, text, count=1)
+
+open(path, "w", encoding="utf-8", newline="\n").write(text)
+PYEOF
 }
 
 write_env_file() {
@@ -245,18 +273,18 @@ show_access() {
     echo "=================================================="
     echo -e "\033[32m✅ Dujiao-Next 已部署\033[0m"
     echo "--------------------------------------------------"
-    echo -e "API 本机检测: \033[36mhttp://127.0.0.1:${api_port}/health\033[0m"
+    echo -e "API 检测: \033[36mhttp://127.0.0.1:${api_port}/health\033[0m"
 
     if [[ "$user_bind_ip" == "0.0.0.0" ]]; then
-        echo -e "前台公网访问: \033[36mhttp://${ip}:${user_port}\033[0m"
+        echo -e "前台地址: \033[36mhttp://${ip}:${user_port}\033[0m"
     else
-        echo -e "前台本机访问: \033[36mhttp://127.0.0.1:${user_port}\033[0m"
+        echo -e "前台地址: \033[36mhttp://127.0.0.1:${user_port}\033[0m"
     fi
 
     if [[ "$admin_bind_ip" == "0.0.0.0" ]]; then
-        echo -e "后台公网访问: \033[36mhttp://${ip}:${admin_port}\033[0m"
+        echo -e "后台地址: \033[36mhttp://${ip}:${admin_port}\033[0m"
     else
-        echo -e "后台本机访问: \033[36mhttp://127.0.0.1:${admin_port}\033[0m"
+        echo -e "后台地址: \033[36mhttp://127.0.0.1:${admin_port}\033[0m"
     fi
 
     echo "--------------------------------------------------"
@@ -272,8 +300,10 @@ wait_app_ready() {
 
     for i in {1..60}; do
         if docker ps --format '{{.Names}} {{.Status}}' | grep -q "^${API_CONTAINER} .*Up"; then
-            info "API 容器已启动。"
-            return 0
+            if curl -fsSL "http://127.0.0.1:$(grep -oP '^API_PORT=\K.*' .env)/health" >/dev/null 2>&1; then
+                info "API 已就绪。"
+                return 0
+            fi
         fi
         sleep 2
     done
@@ -331,7 +361,7 @@ deploy_dujiao_next() {
     fi
 
     mkdir -p "$install_path"/{config,data/db,data/uploads,data/logs,data/redis,backups}
-    chmod -R 0777 "$install_path"/data/logs "$install_path"/data/db "$install_path"/data/uploads "$install_path"/data/redis
+    chmod -R 0777 "$install_path"/data 2>/dev/null || true
 
     echo "$install_path" > "$ENV_RECORD_FILE"
     cd "$install_path" || return
@@ -345,7 +375,7 @@ deploy_dujiao_next() {
 
     info "拉取官方镜像并启动..."
     $dc_cmd --env-file .env -f "$COMPOSE_FILE" pull || die "镜像拉取失败。"
-    $dc_cmd --env-file .env -f "$COMPOSE_FILE" up -d || die "服务启动失败。"
+    $dc_cmd --env-file .env -f "$COMPOSE_FILE" up -d --force-recreate || die "服务启动失败。"
 
     wait_app_ready || true
     show_access "$install_path"
@@ -364,7 +394,7 @@ upgrade_service() {
 
     info "开始升级..."
     compose_run pull || die "镜像拉取失败。"
-    compose_run up -d || die "服务重建失败。"
+    compose_run up -d --force-recreate || die "服务重建失败。"
 
     wait_app_ready || true
     show_access "$workdir"
@@ -394,7 +424,16 @@ restart_service() {
     }
 
     cd "$workdir" || return
-    compose_run restart
+
+    local redis_env
+    redis_env="$(grep -oP '^REDIS_PASSWORD=\K.*' .env 2>/dev/null || true)"
+
+    if [[ -n "$redis_env" ]]; then
+        REDIS_PASS="$redis_env"
+        patch_config_yml "$workdir"
+    fi
+
+    compose_run up -d --force-recreate
     wait_app_ready || true
     show_access "$workdir"
 }
@@ -411,36 +450,7 @@ show_logs() {
     cd "$workdir" || return
     compose_run ps
     echo ""
-    compose_run logs --tail=120 api
-}
-
-reset_admin_password() {
-    local workdir
-    workdir="$(get_workdir)"
-
-    [[ -z "$workdir" ]] && {
-        err "未发现部署环境。"
-        return
-    }
-
-    cd "$workdir" || return
-
-    local new_pass
-    new_pass="$(openssl rand -hex 16)"
-
-    if grep -q '^DJ_DEFAULT_ADMIN_PASSWORD=' .env; then
-        sed -i "s/^DJ_DEFAULT_ADMIN_PASSWORD=.*/DJ_DEFAULT_ADMIN_PASSWORD=${new_pass}/" .env
-    else
-        echo "DJ_DEFAULT_ADMIN_PASSWORD=${new_pass}" >> .env
-    fi
-
-    ADMIN_PASS="$new_pass"
-    REDIS_PASS="$(grep -oP '^REDIS_PASSWORD=\K.*' .env 2>/dev/null || openssl rand -hex 24)"
-    write_pwd_file "$workdir"
-
-    warn "注意：默认管理员密码通常只在首次初始化时生效。"
-    compose_run up -d
-    show_access "$workdir"
+    compose_run logs --tail=160 api
 }
 
 change_ports() {
@@ -476,14 +486,14 @@ change_ports() {
     local new_user_bind="$old_user_bind"
     local new_admin_bind="$old_admin_bind"
 
-    read -r -p "前台是否允许公网直接访问？当前 ${old_user_bind}，输入 y 公网 / n 本机 / 回车不变: " pub_user
+    read -r -p "前台公网监听？输入 y 公网 / n 本机 / 回车不变: " pub_user
     if [[ "$pub_user" =~ ^[Yy]$ ]]; then
         new_user_bind="0.0.0.0"
     elif [[ "$pub_user" =~ ^[Nn]$ ]]; then
         new_user_bind="127.0.0.1"
     fi
 
-    read -r -p "后台是否允许公网直接访问？当前 ${old_admin_bind}，输入 y 公网 / n 本机 / 回车不变: " pub_admin
+    read -r -p "后台公网监听？输入 y 公网 / n 本机 / 回车不变: " pub_admin
     if [[ "$pub_admin" =~ ^[Yy]$ ]]; then
         new_admin_bind="0.0.0.0"
     elif [[ "$pub_admin" =~ ^[Nn]$ ]]; then
@@ -496,7 +506,33 @@ change_ports() {
     sed -i "s/^USER_BIND_IP=.*/USER_BIND_IP=${new_user_bind}/" .env
     sed -i "s/^ADMIN_BIND_IP=.*/ADMIN_BIND_IP=${new_admin_bind}/" .env
 
-    compose_run up -d
+    compose_run up -d --force-recreate
+    show_access "$workdir"
+}
+
+fix_redis_config() {
+    local workdir
+    workdir="$(get_workdir)"
+
+    [[ -z "$workdir" ]] && {
+        err "未发现部署环境。"
+        return
+    }
+
+    cd "$workdir" || return
+
+    local redis_env
+    redis_env="$(grep -oP '^REDIS_PASSWORD=\K.*' .env 2>/dev/null || true)"
+
+    [[ -z "$redis_env" ]] && die ".env 中找不到 REDIS_PASSWORD。"
+
+    REDIS_PASS="$redis_env"
+    patch_config_yml "$workdir"
+
+    compose_run down --remove-orphans
+    compose_run up -d --force-recreate
+
+    wait_app_ready || true
     show_access "$workdir"
 }
 
@@ -534,150 +570,67 @@ do_backup() {
     info "备份完成: ${backup_file}"
 }
 
-restore_backup() {
-    local workdir
-    workdir="$(get_workdir)"
-
-    local search_dir="${workdir:-$DEFAULT_INSTALL_PATH}/backups"
-    local default_backup
-    default_backup="$(ls -t "${search_dir}"/dujiaonext_backup_*.tar.gz 2>/dev/null | head -n 1 || true)"
-
-    read -r -p "输入备份文件路径 [回车使用最新备份: ${default_backup}]: " backup_path
-    local path="${backup_path:-$default_backup}"
-
-    [[ ! -f "$path" ]] && {
-        err "备份文件不存在。"
-        return
-    }
-
-    read -r -p "恢复目标目录 [回车默认: $DEFAULT_INSTALL_PATH]: " target_dir
-    local wd="${target_dir:-$DEFAULT_INSTALL_PATH}"
-
-    if [[ -d "$wd" ]]; then
-        read -r -p "目标目录已存在，是否删除并恢复？(y/N): " confirm
-        [[ ! "$confirm" =~ ^[Yy]$ ]] && return
-
-        cd "$wd" 2>/dev/null && compose_run down 2>/dev/null || true
-        docker rm -f "$API_CONTAINER" "$USER_CONTAINER" "$ADMIN_CONTAINER" "$REDIS_CONTAINER" 2>/dev/null || true
-        cd /
-        rm -rf "$wd"
-    fi
-
-    mkdir -p "$wd"
-    tar -xzf "$path" -C "$wd" || die "解压备份失败。"
-
-    echo "$wd" > "$ENV_RECORD_FILE"
-
-    cd "$wd" || return
-    chmod -R 0777 data/logs data/db data/uploads data/redis 2>/dev/null || true
-
-    compose_run up -d || die "恢复后启动失败。"
-
-    wait_app_ready || true
-    show_access "$wd"
-}
-
-setup_auto_backup() {
-    require_cmd crontab
-
-    local workdir
-    workdir="$(get_workdir)"
-
-    [[ -z "$workdir" ]] && {
-        err "环境未部署。"
-        return
-    }
-
-    local cron_script="${workdir}/cron_backup.sh"
-    local script_path
-    script_path="$(readlink -f "${BASH_SOURCE[0]}")"
-
-    echo " 1) 每隔 N 分钟备份"
-    echo " 2) 每天固定时间备份"
-    echo " 3) 删除定时备份"
-
-    read -r -p "请选择 [1/2/3]: " cron_type
-    local cron_spec=""
-
-    case "$cron_type" in
-        1)
-            read -r -p "输入间隔分钟数，例如 10/15/20/30/60: " min_interval
-            [[ "$min_interval" =~ ^[0-9]+$ ]] || {
-                err "分钟数非法。"
-                return
-            }
-            cron_spec="*/${min_interval} * * * *"
-        ;;
-        2)
-            read -r -p "输入时间，例如 04:30: " cron_time
-            local hour="${cron_time%:*}"
-            local minute="${cron_time#*:}"
-            [[ "$hour" =~ ^[0-9]+$ && "$minute" =~ ^[0-9]+$ ]] || {
-                err "时间格式错误。"
-                return
-            }
-            cron_spec="${minute} ${hour} * * *"
-        ;;
-        3)
-            crontab -l 2>/dev/null | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d" | crontab - 2>/dev/null || true
-            rm -f "$cron_script"
-            info "定时备份已删除。"
-            return
-        ;;
-        *)
-            err "选择无效。"
-            return
-        ;;
-    esac
-
-    cat > "$cron_script" <<CRONEOF
-#!/usr/bin/env bash
-bash "$script_path" run-backup >> "$BACKUP_LOG" 2>&1
-CRONEOF
-
-    chmod +x "$cron_script"
-
-    (
-        crontab -l 2>/dev/null | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d"
-        echo "$CRON_TAG_BEGIN"
-        echo "${cron_spec} bash ${cron_script}"
-        echo "$CRON_TAG_END"
-    ) | crontab -
-
-    info "定时备份已设置。"
-}
-
 uninstall_service() {
     local workdir
     workdir="$(get_workdir)"
 
     [[ -z "$workdir" ]] && workdir="$DEFAULT_INSTALL_PATH"
 
-    echo -e "\033[31m⚠️ 警告：这会停止服务并删除本地数据！\033[0m"
-    read -r -p "确认卸载？(y/N): " confirm
-    [[ ! "$confirm" =~ ^[Yy]$ ]] && return
+    echo -e "\033[31m⚠️ 警告：这会停止服务，并删除 Dujiao-Next 本地数据！\033[0m"
+    read -r -p "确认完全卸载？请输入 y: " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && {
+        warn "已取消卸载。"
+        return
+    }
+
+    info "停止 compose 服务..."
 
     if [[ -d "$workdir" ]]; then
-        cd "$workdir" 2>/dev/null && compose_run down 2>/dev/null || true
+        if [[ -f "$workdir/$COMPOSE_FILE" ]]; then
+            cd "$workdir" 2>/dev/null && {
+                docker compose --env-file .env -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
+                docker-compose --env-file .env -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
+            }
+        fi
     fi
 
-    docker rm -f "$API_CONTAINER" "$USER_CONTAINER" "$ADMIN_CONTAINER" "$REDIS_CONTAINER" 2>/dev/null || true
+    info "删除相关容器..."
+    docker rm -f \
+        "$API_CONTAINER" \
+        "$USER_CONTAINER" \
+        "$ADMIN_CONTAINER" \
+        "$REDIS_CONTAINER" \
+        dujiao_next \
+        dujiao-next \
+        2>/dev/null || true
 
+    info "删除相关网络..."
+    docker network ls --format '{{.Name}}' \
+        | grep -Ei 'dujiao|dujiaonext' \
+        | xargs -r docker network rm 2>/dev/null || true
+
+    info "删除相关卷..."
+    docker volume ls -q \
+        | grep -Ei 'dujiao|dujiaonext' \
+        | xargs -r docker volume rm -f 2>/dev/null || true
+
+    info "删除安装目录和记录文件..."
     cd /
     rm -rf "$workdir"
+    rm -rf "$DEFAULT_INSTALL_PATH"
     rm -f "$ENV_RECORD_FILE"
+    rm -f "$BACKUP_LOG"
+    rm -f /etc/cron.d/dujiaonext /etc/cron.d/dujiao-next 2>/dev/null || true
 
-    crontab -l 2>/dev/null | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d" | crontab - 2>/dev/null || true
+    info "清理定时任务..."
+    crontab -l 2>/dev/null \
+        | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d" \
+        | crontab - 2>/dev/null || true
 
-    info "已完全卸载。"
-}
+    info "清理悬空资源..."
+    docker system prune -f >/dev/null 2>&1 || true
 
-install_ftp() {
-    clear
-    echo -e "\033[32m📂 FTP/SFTP 备份工具加载中...\033[0m"
-    bash <(curl -fsSL https://raw.githubusercontent.com/hiapb/ftp/main/back.sh | sed 's/\r$//')
-    sleep 2
-    exit 0
+    info "卸载完成。"
 }
 
 main_menu() {
@@ -696,17 +649,14 @@ main_menu() {
     echo "  3) 停止服务"
     echo "  4) 重启服务"
     echo "  5) 手动备份"
-    echo "  6) 恢复备份"
-    echo "  7) 定时备份"
+    echo "  6) 修复 Redis 配置/NOAUTH"
+    echo "  7) 查看状态和 API 日志"
     echo "  8) 完全卸载"
-    echo "  9) FTP/SFTP 备份工具"
-    echo " 10) 重置默认后台密码"
-    echo " 11) 查看状态和 API 日志"
-    echo " 12) 修改端口/公网监听"
+    echo "  9) 修改端口/公网监听"
     echo "  0) 退出"
     echo "==================================================="
 
-    read -r -p "请输入选项 [0-12]: " choice
+    read -r -p "请输入选项 [0-9]: " choice
 
     case "$choice" in
         1) deploy_dujiao_next ;;
@@ -714,13 +664,10 @@ main_menu() {
         3) pause_service ;;
         4) restart_service ;;
         5) do_backup ;;
-        6) restore_backup ;;
-        7) setup_auto_backup ;;
+        6) fix_redis_config ;;
+        7) show_logs ;;
         8) uninstall_service ;;
-        9) install_ftp ;;
-        10) reset_admin_password ;;
-        11) show_logs ;;
-        12) change_ports ;;
+        9) change_ports ;;
         0) info "已退出。"; exit 0 ;;
         *) warn "无效选项。" ;;
     esac
