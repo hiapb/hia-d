@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 
 set -o pipefail
-
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 DEFAULT_INSTALL_PATH="/opt/dujiao-next"
@@ -32,9 +31,7 @@ warn() { echo -e "\033[33m[WARN]\033[0m $1" >&2; }
 err()  { echo -e "\033[31m[ERROR]\033[0m $1" >&2; }
 die()  { echo -e "\033[31m[FATAL]\033[0m $1" >&2; exit 1; }
 
-require_cmd() {
-    command -v "$1" >/dev/null 2>&1 || die "系统缺少依赖: $1"
-}
+require_cmd() { command -v "$1" >/dev/null 2>&1 || die "系统缺少依赖: $1"; }
 
 get_local_ip() {
     hostname -I 2>/dev/null | awk '{print $1}'
@@ -124,11 +121,6 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
     networks:
       - dujiao-net
 
@@ -139,8 +131,7 @@ services:
     expose:
       - "80"
     depends_on:
-      api:
-        condition: service_healthy
+      - api
     networks:
       - dujiao-net
 
@@ -151,8 +142,7 @@ services:
     expose:
       - "80"
     depends_on:
-      api:
-        condition: service_healthy
+      - api
     networks:
       - dujiao-net
 
@@ -198,8 +188,8 @@ create_nginx_files() {
 server {
     listen 80;
     server_name _;
-
     client_max_body_size 100m;
+    gzip off;
 
     location / {
         proxy_pass http://user:80;
@@ -207,6 +197,11 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Accept-Encoding "";
+
+        sub_filter_once off;
+        sub_filter_types text/html text/css application/javascript;
+        sub_filter '</head>' '<style>a[href="https://github.com/dujiao-next"],a[href="https://github.com/dujiao-next/dujiao-next"]{display:none!important;visibility:hidden!important;width:0!important;height:0!important;overflow:hidden!important;}</style></head>';
     }
 
     location /api/ {
@@ -221,18 +216,14 @@ server {
         proxy_pass http://api:8080/uploads/;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
     }
 
     location = /sitemap.xml {
         proxy_pass http://api:8080/sitemap.xml;
-        proxy_set_header Host $host;
     }
 
     location = /robots.txt {
         proxy_pass http://api:8080/robots.txt;
-        proxy_set_header Host $host;
     }
 }
 EOF
@@ -241,7 +232,6 @@ EOF
 server {
     listen 80;
     server_name _;
-
     client_max_body_size 100m;
 
     location / {
@@ -264,8 +254,6 @@ server {
         proxy_pass http://api:8080/uploads/;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 EOF
@@ -276,7 +264,6 @@ download_config() {
     local cfg="${workdir}/config/config.yml"
 
     if [[ -f "$cfg" ]]; then
-        warn "已存在 config/config.yml，跳过下载。"
         return
     fi
 
@@ -311,13 +298,11 @@ else:
     text += "\n\n" + redis_block
 
 text = re.sub(r'(?m)^(\s*host:\s*)(127\.0\.0\.1|localhost)\s*$', r'\1redis', text)
-
 text = re.sub(r'(?m)^(\s*driver:\s*)(mysql|postgres|postgresql)\s*$', r'\1sqlite', text)
 text = re.sub(r'(?m)^(\s*dsn:\s*).+$', r'\1/app/db/dujiao.db', text)
 
 alphabet = string.ascii_letters + string.digits
 secret = ''.join(secrets.choice(alphabet) for _ in range(48))
-
 text = re.sub(r'(?m)^(\s*secret:\s*)(your.*|change.*|please.*)$', r'\1' + secret, text)
 
 open(path, "w", encoding="utf-8", newline="\n").write(text)
@@ -364,7 +349,7 @@ show_access() {
 
     echo ""
     echo "=================================================="
-    echo -e "\033[32m✅ Dujiao-Next 已部署\033[0m"
+    echo -e "\033[32m✅ Dujiao-Next 已就绪\033[0m"
     echo "--------------------------------------------------"
     echo -e "API 检测: \033[36mhttp://127.0.0.1:${api_port}/health\033[0m"
 
@@ -471,11 +456,7 @@ deploy_dujiao_next() {
 upgrade_service() {
     local workdir
     workdir="$(get_workdir)"
-
-    [[ -z "$workdir" ]] && {
-        err "未找到部署记录。"
-        return
-    }
+    [[ -z "$workdir" ]] && { err "未找到部署记录。"; return; }
 
     cd "$workdir" || return
 
@@ -531,7 +512,8 @@ do_backup() {
     local timestamp
     timestamp="$(date +"%Y%m%d_%H%M%S")"
 
-    local temp_dir="${backup_dir}/tmp_${timestamp}"
+    local temp_dir="/tmp/dujiaonext_backup_tmp_${timestamp}"
+    rm -rf "$temp_dir"
     mkdir -p "$temp_dir"
 
     cp "${workdir}/${COMPOSE_FILE}" "${temp_dir}/" 2>/dev/null || true
@@ -546,7 +528,7 @@ do_backup() {
     rm -rf "$temp_dir"
 
     cd "$backup_dir" || return
-    ls -t dujiaonext_backup_*.tar.gz 2>/dev/null | awk 'NR>5' | xargs -r rm -f
+    ls -t dujiaonext_backup_*.tar.gz 2>/dev/null | awk 'NR>20' | xargs -r rm -f
 
     info "备份完成: ${backup_file}"
 }
@@ -567,28 +549,54 @@ restore_backup() {
         return
     }
 
+    local safe_backup="/tmp/dujiaonext_restore_$(date +%s).tar.gz"
+    cp "$path" "$safe_backup" || die "复制备份到临时目录失败。"
+
     read -r -p "恢复目标目录 [回车默认: $DEFAULT_INSTALL_PATH]: " target_dir
     local wd="${target_dir:-$DEFAULT_INSTALL_PATH}"
 
-    if [[ -d "$wd" ]]; then
-        read -r -p "目标目录已存在，是否删除并恢复？(y/N): " confirm
-        [[ ! "$confirm" =~ ^[Yy]$ ]] && return
+    local timestamp
+    timestamp="$(date +"%Y%m%d_%H%M%S")"
+    local old_dir="${wd}.before_restore_${timestamp}"
 
-        cd "$wd" 2>/dev/null && {
-            docker compose --env-file .env -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
-            docker-compose --env-file .env -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
+    if [[ -d "$wd" ]]; then
+        warn "目标目录已存在，不会删除。"
+        read -r -p "是否停止服务并把当前目录改名为 ${old_dir} 后恢复？(y/N): " confirm
+        [[ ! "$confirm" =~ ^[Yy]$ ]] && {
+            rm -f "$safe_backup"
+            warn "已取消恢复。"
+            return
         }
-        cd /
-        rm -rf "$wd"
+
+        if [[ -f "$wd/$COMPOSE_FILE" ]]; then
+            cd "$wd" 2>/dev/null && {
+                docker compose --env-file .env -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
+                docker-compose --env-file .env -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
+            }
+        fi
+
+        mv "$wd" "$old_dir" || {
+            rm -f "$safe_backup"
+            die "旧目录改名失败，未执行恢复。"
+        }
+
+        info "旧目录已保留: ${old_dir}"
     fi
 
     mkdir -p "$wd"
-    tar -xzf "$path" -C "$wd" || die "解压备份失败。"
+
+    tar -xzf "$safe_backup" -C "$wd" || {
+        rm -f "$safe_backup"
+        die "解压备份失败。"
+    }
+
+    mkdir -p "$wd/backups"
+    cp "$safe_backup" "$wd/backups/$(basename "$path")" 2>/dev/null || true
+    rm -f "$safe_backup"
 
     echo "$wd" > "$ENV_RECORD_FILE"
 
     cd "$wd" || return
-
     chmod -R 0777 data 2>/dev/null || true
 
     REDIS_PASS="$(grep -oP '^REDIS_PASSWORD=\K.*' .env 2>/dev/null || true)"
@@ -618,27 +626,33 @@ setup_auto_backup() {
     local script_path
     script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 
-    echo " 1) 每隔 N 分钟备份"
-    echo " 2) 每天固定时间备份"
-    echo " 3) 删除定时备份"
+    echo " 1) 每 3 分钟备份，推荐"
+    echo " 2) 自定义每隔 N 分钟备份"
+    echo " 3) 每天固定时间备份"
+    echo " 4) 删除定时备份"
 
-    read -r -p "请选择 [1/2/3]: " cron_type
+    read -r -p "请选择 [1/2/3/4，回车默认 1]: " cron_type
+    cron_type="${cron_type:-1}"
+
     local cron_spec=""
 
     case "$cron_type" in
         1)
-            read -r -p "输入间隔分钟数，例如 10/15/20/30/60: " min_interval
+            cron_spec="*/3 * * * *"
+        ;;
+        2)
+            read -r -p "输入间隔分钟数，例如 3/5/10/15/30/60: " min_interval
             [[ "$min_interval" =~ ^[0-9]+$ ]] || { err "分钟数非法。"; return; }
             cron_spec="*/${min_interval} * * * *"
         ;;
-        2)
+        3)
             read -r -p "输入时间，例如 04:30: " cron_time
             local hour="${cron_time%:*}"
             local minute="${cron_time#*:}"
             [[ "$hour" =~ ^[0-9]+$ && "$minute" =~ ^[0-9]+$ ]] || { err "时间格式错误。"; return; }
             cron_spec="${minute} ${hour} * * *"
         ;;
-        3)
+        4)
             crontab -l 2>/dev/null | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d" | crontab - 2>/dev/null || true
             rm -f "$cron_script"
             info "定时备份已删除。"
@@ -664,7 +678,7 @@ EOF
         echo "$CRON_TAG_END"
     ) | crontab -
 
-    info "定时备份已设置。"
+    info "定时备份已设置: ${cron_spec}"
 }
 
 uninstall_service() {
@@ -672,11 +686,9 @@ uninstall_service() {
     workdir="$(get_workdir)"
     [[ -z "$workdir" ]] && workdir="$DEFAULT_INSTALL_PATH"
 
-    echo -e "\033[31m⚠️ 警告：这会停止服务，并删除 Dujiao-Next 本地数据！\033[0m"
+    echo -e "\033[31m⚠️ 警告：这会停止服务，并删除 Dujiao-Next 当前安装目录！\033[0m"
     read -r -p "确认完全卸载？请输入 y: " confirm
     [[ ! "$confirm" =~ ^[Yy]$ ]] && { warn "已取消卸载。"; return; }
-
-    info "停止 compose 服务..."
 
     if [[ -d "$workdir" && -f "$workdir/$COMPOSE_FILE" ]]; then
         cd "$workdir" 2>/dev/null && {
@@ -685,43 +697,23 @@ uninstall_service() {
         }
     fi
 
-    info "删除相关容器..."
     docker rm -f \
-        "$API_CONTAINER" \
-        "$USER_CONTAINER" \
-        "$ADMIN_CONTAINER" \
-        "$REDIS_CONTAINER" \
-        "$USER_GATEWAY_CONTAINER" \
-        "$ADMIN_GATEWAY_CONTAINER" \
-        dujiao_next \
-        dujiao-next \
-        2>/dev/null || true
+        "$API_CONTAINER" "$USER_CONTAINER" "$ADMIN_CONTAINER" "$REDIS_CONTAINER" \
+        "$USER_GATEWAY_CONTAINER" "$ADMIN_GATEWAY_CONTAINER" \
+        dujiao_next dujiao-next 2>/dev/null || true
 
-    info "删除相关网络..."
-    docker network ls --format '{{.Name}}' \
-        | grep -Ei 'dujiao|dujiaonext' \
-        | xargs -r docker network rm 2>/dev/null || true
+    docker network ls --format '{{.Name}}' | grep -Ei 'dujiao|dujiaonext' | xargs -r docker network rm 2>/dev/null || true
+    docker volume ls -q | grep -Ei 'dujiao|dujiaonext' | xargs -r docker volume rm -f 2>/dev/null || true
 
-    info "删除相关卷..."
-    docker volume ls -q \
-        | grep -Ei 'dujiao|dujiaonext' \
-        | xargs -r docker volume rm -f 2>/dev/null || true
-
-    info "删除安装目录和记录文件..."
     cd /
     rm -rf "$workdir"
-    rm -rf "$DEFAULT_INSTALL_PATH"
     rm -f "$ENV_RECORD_FILE"
     rm -f "$BACKUP_LOG"
     rm -f /etc/cron.d/dujiaonext /etc/cron.d/dujiao-next 2>/dev/null || true
 
-    info "清理定时任务..."
-    crontab -l 2>/dev/null \
-        | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d" \
-        | crontab - 2>/dev/null || true
+    crontab -l 2>/dev/null | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d" | crontab - 2>/dev/null || true
 
     docker system prune -f >/dev/null 2>&1 || true
-
     info "卸载完成。"
 }
 
@@ -751,7 +743,6 @@ reset_admin_password() {
 
     ADMIN_PASS="$new_pass"
     REDIS_PASS="$(grep -oP '^REDIS_PASSWORD=\K.*' .env 2>/dev/null || true)"
-
     write_pwd_file "$workdir"
 
     warn "注意：默认后台密码通常只在首次初始化管理员时生效。"
