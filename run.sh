@@ -752,6 +752,121 @@ manage_goods_sold_count() {
 
     info "数据库文件: $db_file"
 
+    print_line() {
+        echo "------------------------------------------------------------------------------------------"
+    }
+
+    print_categories() {
+        printf "%-8s %-30s %-10s\n" "分类ID" "分类名称" "状态"
+        print_line
+
+        sqlite3 -separator '|' "$db_file" "
+            SELECT
+                id,
+                COALESCE(
+                    NULLIF(json_extract(name_json, '$.zh-CN'), ''),
+                    NULLIF(json_extract(name_json, '$.zh-TW'), ''),
+                    NULLIF(json_extract(name_json, '$.en-US'), ''),
+                    name_json
+                ),
+                CASE
+                    WHEN is_active=1 OR is_active='true' THEN '启用'
+                    ELSE '禁用'
+                END
+            FROM categories
+            ORDER BY sort_order ASC, id ASC;
+        " | while IFS='|' read -r id name status; do
+            printf "%-8s %-30s %-10s\n" "$id" "$name" "$status"
+        done
+    }
+
+    print_products_by_category() {
+        local cid="$1"
+
+        printf "%-8s %-24s %-10s %-10s %-10s %-10s %-10s %-10s\n" \
+            "商品ID" "商品名称" "商品库存" "商品锁定" "商品已售" "SKU库存" "SKU锁定" "SKU已售"
+        print_line
+
+        sqlite3 -separator '|' "$db_file" "
+            SELECT
+                p.id,
+                COALESCE(
+                    NULLIF(json_extract(p.title_json, '$.zh-CN'), ''),
+                    NULLIF(json_extract(p.title_json, '$.zh-TW'), ''),
+                    NULLIF(json_extract(p.title_json, '$.en-US'), ''),
+                    p.title_json
+                ),
+                p.manual_stock_total,
+                p.manual_stock_locked,
+                p.manual_stock_sold,
+                COALESCE(SUM(s.manual_stock_total), 0),
+                COALESCE(SUM(s.manual_stock_locked), 0),
+                COALESCE(SUM(s.manual_stock_sold), 0)
+            FROM products p
+            LEFT JOIN product_skus s ON s.product_id = p.id
+            WHERE p.category_id=$cid
+              AND p.deleted_at IS NULL
+            GROUP BY p.id
+            ORDER BY p.sort_order ASC, p.id ASC;
+        " | while IFS='|' read -r id name total locked sold sku_total sku_locked sku_sold; do
+            printf "%-8s %-24s %-10s %-10s %-10s %-10s %-10s %-10s\n" \
+                "$id" "$name" "$total" "$locked" "$sold" "$sku_total" "$sku_locked" "$sku_sold"
+        done
+    }
+
+    print_product_detail() {
+        local pid="$1"
+
+        printf "%-8s %-24s %-10s %-10s %-10s %-10s %-10s %-10s\n" \
+            "商品ID" "商品名称" "商品库存" "商品锁定" "商品已售" "SKU库存" "SKU锁定" "SKU已售"
+        print_line
+
+        sqlite3 -separator '|' "$db_file" "
+            SELECT
+                p.id,
+                COALESCE(
+                    NULLIF(json_extract(p.title_json, '$.zh-CN'), ''),
+                    NULLIF(json_extract(p.title_json, '$.zh-TW'), ''),
+                    NULLIF(json_extract(p.title_json, '$.en-US'), ''),
+                    p.title_json
+                ),
+                p.manual_stock_total,
+                p.manual_stock_locked,
+                p.manual_stock_sold,
+                COALESCE(SUM(s.manual_stock_total), 0),
+                COALESCE(SUM(s.manual_stock_locked), 0),
+                COALESCE(SUM(s.manual_stock_sold), 0)
+            FROM products p
+            LEFT JOIN product_skus s ON s.product_id = p.id
+            WHERE p.id=$pid
+            GROUP BY p.id;
+        " | while IFS='|' read -r id name total locked sold sku_total sku_locked sku_sold; do
+            printf "%-8s %-24s %-10s %-10s %-10s %-10s %-10s %-10s\n" \
+                "$id" "$name" "$total" "$locked" "$sold" "$sku_total" "$sku_locked" "$sku_sold"
+        done
+    }
+
+    print_skus() {
+        local pid="$1"
+
+        printf "%-8s %-16s %-10s %-10s %-10s\n" "SKU_ID" "SKU编码" "库存" "锁定" "已售"
+        print_line
+
+        sqlite3 -separator '|' "$db_file" "
+            SELECT
+                id,
+                COALESCE(NULLIF(sku_code, ''), '-'),
+                manual_stock_total,
+                manual_stock_locked,
+                manual_stock_sold
+            FROM product_skus
+            WHERE product_id=$pid
+            ORDER BY sort_order ASC, id ASC;
+        " | while IFS='|' read -r id code total locked sold; do
+            printf "%-8s %-16s %-10s %-10s %-10s\n" "$id" "$code" "$total" "$locked" "$sold"
+        done
+    }
+
     echo ""
     echo "==================================================="
     echo "              修改商品已售数量"
@@ -759,20 +874,9 @@ manage_goods_sold_count() {
     echo ""
 
     echo "分类列表："
-    echo "---------------------------------------------------"
-    sqlite3 -header -column "$db_file" "
-        SELECT
-            id AS 分类ID,
-            COALESCE(
-                NULLIF(json_extract(name_json, '$.zh-CN'), ''),
-                NULLIF(json_extract(name_json, '$.zh-TW'), ''),
-                NULLIF(json_extract(name_json, '$.en-US'), ''),
-                name_json
-            ) AS 分类名称
-        FROM categories
-        ORDER BY sort_order ASC, id ASC;
-    "
-    echo "---------------------------------------------------"
+    print_line
+    print_categories
+    print_line
 
     read -r -p "请输入分类ID: " category_id
 
@@ -791,32 +895,9 @@ manage_goods_sold_count() {
 
     echo ""
     echo "商品列表："
-    echo "---------------------------------------------------"
-
-    sqlite3 -header -column "$db_file" "
-        SELECT
-            p.id AS 商品ID,
-            COALESCE(
-                NULLIF(json_extract(p.title_json, '$.zh-CN'), ''),
-                NULLIF(json_extract(p.title_json, '$.zh-TW'), ''),
-                NULLIF(json_extract(p.title_json, '$.en-US'), ''),
-                p.title_json
-            ) AS 商品名称,
-            p.manual_stock_total AS 商品库存,
-            p.manual_stock_locked AS 商品锁定,
-            p.manual_stock_sold AS 商品已售,
-            COALESCE(SUM(s.manual_stock_total), 0) AS SKU库存,
-            COALESCE(SUM(s.manual_stock_locked), 0) AS SKU锁定,
-            COALESCE(SUM(s.manual_stock_sold), 0) AS SKU已售
-        FROM products p
-        LEFT JOIN product_skus s ON s.product_id = p.id AND s.deleted_at IS NULL
-        WHERE p.category_id=$category_id
-          AND p.deleted_at IS NULL
-        GROUP BY p.id
-        ORDER BY p.sort_order ASC, p.id ASC;
-    "
-
-    echo "---------------------------------------------------"
+    print_line
+    print_products_by_category "$category_id"
+    print_line
 
     read -r -p "请输入要修改的商品ID: " product_id
 
@@ -826,7 +907,13 @@ manage_goods_sold_count() {
     }
 
     local product_exists
-    product_exists="$(sqlite3 "$db_file" "SELECT COUNT(*) FROM products WHERE id=$product_id AND category_id=$category_id AND deleted_at IS NULL;")"
+    product_exists="$(sqlite3 "$db_file" "
+        SELECT COUNT(*)
+        FROM products
+        WHERE id=$product_id
+          AND category_id=$category_id
+          AND deleted_at IS NULL;
+    ")"
 
     [[ "$product_exists" != "1" ]] && {
         err "商品不存在或不属于该分类。"
@@ -835,44 +922,15 @@ manage_goods_sold_count() {
 
     echo ""
     echo "当前商品信息："
-    echo "---------------------------------------------------"
-    sqlite3 -header -column "$db_file" "
-        SELECT
-            p.id AS 商品ID,
-            COALESCE(
-                NULLIF(json_extract(p.title_json, '$.zh-CN'), ''),
-                NULLIF(json_extract(p.title_json, '$.zh-TW'), ''),
-                NULLIF(json_extract(p.title_json, '$.en-US'), ''),
-                p.title_json
-            ) AS 商品名称,
-            p.manual_stock_total AS 商品库存,
-            p.manual_stock_locked AS 商品锁定,
-            p.manual_stock_sold AS 商品已售,
-            COALESCE(SUM(s.manual_stock_total), 0) AS SKU库存,
-            COALESCE(SUM(s.manual_stock_locked), 0) AS SKU锁定,
-            COALESCE(SUM(s.manual_stock_sold), 0) AS SKU已售
-        FROM products p
-        LEFT JOIN product_skus s ON s.product_id = p.id AND s.deleted_at IS NULL
-        WHERE p.id=$product_id
-        GROUP BY p.id;
-    "
+    print_line
+    print_product_detail "$product_id"
+    print_line
 
     echo ""
-    echo "该商品 SKU 列表："
-    echo "---------------------------------------------------"
-    sqlite3 -header -column "$db_file" "
-        SELECT
-            id AS SKU_ID,
-            sku_code AS SKU编码,
-            manual_stock_total AS 库存,
-            manual_stock_locked AS 锁定,
-            manual_stock_sold AS 已售
-        FROM product_skus
-        WHERE product_id=$product_id
-          AND deleted_at IS NULL
-        ORDER BY sort_order ASC, id ASC;
-    "
-    echo "---------------------------------------------------"
+    echo "当前 SKU 信息："
+    print_line
+    print_skus "$product_id"
+    print_line
 
     read -r -p "请输入新的已售数量: " new_sold
 
@@ -882,7 +940,10 @@ manage_goods_sold_count() {
     }
 
     echo ""
-    echo "你将把商品 ID ${product_id} 的已售数量改为: ${new_sold}"
+    echo "将执行："
+    echo "  products.manual_stock_sold = ${new_sold}"
+    echo "  product_skus.manual_stock_sold = ${new_sold}"
+    echo ""
     read -r -p "确认修改？(y/N): " confirm
 
     [[ ! "$confirm" =~ ^[Yy]$ ]] && {
@@ -903,8 +964,7 @@ manage_goods_sold_count() {
         SET
             manual_stock_sold=$new_sold,
             updated_at=datetime('now')
-        WHERE product_id=$product_id
-          AND deleted_at IS NULL;
+        WHERE product_id=$product_id;
 
         COMMIT;
     " || {
@@ -912,13 +972,27 @@ manage_goods_sold_count() {
         return
     }
 
-    info "数据库已修改，正在清理缓存..."
+    info "数据库已修改。"
+
+    echo ""
+    echo "修改后商品信息："
+    print_line
+    print_product_detail "$product_id"
+    print_line
+
+    echo ""
+    echo "修改后 SKU 信息："
+    print_line
+    print_skus "$product_id"
+    print_line
+
+    info "正在清理缓存..."
 
     local redis_pass
     redis_pass="$(grep -oP '^REDIS_PASSWORD=\K.*' "$workdir/.env" 2>/dev/null || true)"
 
     if [[ -n "$redis_pass" ]]; then
-        docker exec "$REDIS_CONTAINER" redis-cli -a "$redis_pass" FLUSHDB >/dev/null 2>&1 || true
+        docker exec "$REDIS_CONTAINER" redis-cli -a "$redis_pass" FLUSHALL >/dev/null 2>&1 || true
     fi
 
     docker restart "$API_CONTAINER" >/dev/null 2>&1 || true
@@ -928,32 +1002,12 @@ manage_goods_sold_count() {
     info "修改完成。"
 
     echo ""
-    echo "修改后商品信息："
-    echo "---------------------------------------------------"
-    sqlite3 -header -column "$db_file" "
-        SELECT
-            p.id AS 商品ID,
-            COALESCE(
-                NULLIF(json_extract(p.title_json, '$.zh-CN'), ''),
-                NULLIF(json_extract(p.title_json, '$.zh-TW'), ''),
-                NULLIF(json_extract(p.title_json, '$.en-US'), ''),
-                p.title_json
-            ) AS 商品名称,
-            p.manual_stock_total AS 商品库存,
-            p.manual_stock_locked AS 商品锁定,
-            p.manual_stock_sold AS 商品已售,
-            COALESCE(SUM(s.manual_stock_total), 0) AS SKU库存,
-            COALESCE(SUM(s.manual_stock_locked), 0) AS SKU锁定,
-            COALESCE(SUM(s.manual_stock_sold), 0) AS SKU已售
-        FROM products p
-        LEFT JOIN product_skus s ON s.product_id = p.id AND s.deleted_at IS NULL
-        WHERE p.id=$product_id
-        GROUP BY p.id;
-    "
-
-    echo "---------------------------------------------------"
-    warn "后台页面请 Ctrl + F5 强制刷新。"
+    warn "如果后台还是 0，说明后台页面不是读 products/product_skus，而是读订单统计。"
+    warn "这时需要改 orders/order_items 统计数据，不是库存表字段。"
+    warn "先 Ctrl + F5 强制刷新后台页面。"
 }
+
+
 uninstall_service() {
     local workdir
     workdir="$(get_workdir)"
