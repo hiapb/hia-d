@@ -560,7 +560,6 @@ restore_backup() {
     local old_dir="${wd}.before_restore_${timestamp}"
 
     if [[ -d "$wd" ]]; then
-        warn "目标目录已存在，不会删除。"
         read -r -p "是否停止服务并把当前目录改名为 ${old_dir} 后恢复？(y/N): " confirm
         [[ ! "$confirm" =~ ^[Yy]$ ]] && {
             rm -f "$safe_backup"
