@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ==========================================
-# Dujiao-Next 自动化运维矩阵
+# Dujiao-Next 自动化运维矩阵 (纯净版)
 # ==========================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
@@ -14,10 +14,9 @@ CRON_TAG_END="# DUJIAO_BACKUP_END"
 BACKUP_LOG="/var/log/dujiaonext_backup.log"
 
 CONTAINER_NAME="dujiao_next"
-# 替换为实际的 Dujiao-Next 官方或您编译的镜像地址
-IMAGE_NAME="ghcr.io/apernet/dujiao-next:latest" 
+IMAGE_NAME="ghcr.io/apernet/dujiao-next:latest"
 
-# [核心变更] 重置默认端口，规避常见扫描器
+# 规避常见扫描器
 DEFAULT_HOST_PORT="34567"
 
 ADMIN_PASS=""
@@ -53,7 +52,6 @@ get_workdir() {
 }
 
 generate_admin_password() {
-    # 采用高熵随机数生成 16 字节十六进制密码，抵御字典爆破
     ADMIN_PASS=$(openssl rand -hex 16)
 }
 
@@ -94,7 +92,7 @@ show_access() {
     echo -e "核心数据目录: \033[33m${workdir}/configs\033[0m"
     echo "--------------------------------------------------"
     echo "网络映射逻辑:"
-    echo "  公网/网关: ${host_port} 穿透至容器层 3000 (或根据镜像底层自行映射)"
+    echo "  公网/网关: ${host_port} 穿透至容器层 3000"
     echo "=================================================="
     echo ""
 }
@@ -118,7 +116,7 @@ wait_app_ready() {
 create_compose_file() {
     local workdir="$1"
 
-    cat > "${workdir}/docker-compose.yml" <<EOF
+    cat > "${workdir}/docker-compose.yml" <<DOCKEREOF
 services:
   dujiao-next:
     image: ${IMAGE_NAME}
@@ -132,10 +130,10 @@ services:
     environment:
       - TZ=\${TZ}
       - APP_ENV=production
-EOF
+DOCKEREOF
 }
 
-deploy_aiclient2api() {
+deploy_dujiao_next() {
     info "== 启动 Dujiao-Next 工业级编排 =="
 
     require_cmd docker
@@ -151,7 +149,7 @@ deploy_aiclient2api() {
     local install_path=${input_path:-$DEFAULT_INSTALL_PATH}
 
     if [[ -d "$install_path" && "$(ls -A "$install_path" 2>/dev/null)" ]]; then
-        err "目标向量域已存在污染数据，为保证数据一致性，请先执行 [8] 进行物理擦除。"
+        err "目标向量域已存在污染数据，请先执行 [8] 进行物理擦除。"
         return
     fi
 
@@ -171,17 +169,17 @@ deploy_aiclient2api() {
     generate_admin_password
     write_pwd_file "$install_path"
 
-    cat > .env <<EOF
+    cat > .env <<ENVEFF
 PORT=${host_port}
 TZ=Asia/Shanghai
-EOF
+ENVEFF
 
     create_compose_file "$install_path"
 
     info "下发镜像拉取指令并构建运行态..."
 
-    $dc_cmd pull || warn "镜像中心响应超时，尝试利用本地缓存冷启动..."
-    $dc_cmd up -d || die "守护进程唤醒失败，请检查 Docker Daemon 状态。"
+    $dc_cmd pull || warn "镜像中心响应超时，尝试冷启动..."
+    $dc_cmd up -d || die "守护进程唤醒失败，请检查 Docker Daemon。"
 
     wait_app_ready || true
     show_access "$install_path"
@@ -275,7 +273,6 @@ do_backup() {
     local temp_dir="${backup_dir}/tmp_${timestamp}"
     mkdir -p "$temp_dir"
 
-    # 执行原子级拷贝，防止读写锁死
     cp "${workdir}/docker-compose.yml" "${temp_dir}/" 2>/dev/null || true
     cp "${workdir}/.env" "${temp_dir}/" 2>/dev/null || true
     [[ -d "${workdir}/configs" ]] && cp -r "${workdir}/configs" "${temp_dir}/configs"
@@ -286,7 +283,6 @@ do_backup() {
     tar -czf "$backup_file" -C "$temp_dir" .
     rm -rf "$temp_dir"
 
-    # 动态修剪陈旧备份，收敛磁盘 IO
     cd "$backup_dir" || return
     ls -t dujiaonext_backup_*.tar.gz 2>/dev/null | awk 'NR>5' | xargs -r rm -f
 
@@ -316,7 +312,7 @@ restore_backup() {
     local wd=${target_dir:-$DEFAULT_INSTALL_PATH}
 
     if [[ -d "$wd" ]]; then
-        read -r -p "侦测到靶区存在残存活动，是否强制降维抹除？(y/N): " confirm
+        read -r -p "侦测到靶区存在残存活动，是否强制抹除？(y/N): " confirm
 
         [[ ! "$confirm" =~ ^[Yy]$ ]] && {
             rm -f "$safe_backup"
@@ -339,17 +335,15 @@ restore_backup() {
     echo "$wd" > "$ENV_RECORD_FILE"
 
     cd "$wd" || return
-
     mkdir -p configs data backups
     chmod -R 777 backups data 2>/dev/null || true
 
     [[ ! -f "${wd}/docker-compose.yml" ]] && create_compose_file "$wd"
-
     if [[ ! -f "${wd}/.env" ]]; then
-        cat > "${wd}/.env" <<EOF
+        cat > "${wd}/.env" <<ENVEFF
 PORT=$DEFAULT_HOST_PORT
 TZ=Asia/Shanghai
-EOF
+ENVEFF
     fi
 
     if [[ ! -f "${wd}/configs/pwd" ]]; then
@@ -365,66 +359,51 @@ EOF
 
 setup_auto_backup() {
     require_cmd crontab
-
     local workdir
     workdir=$(get_workdir)
 
-    [[ -z "$workdir" ]] && {
-        err "环境未注册，终止任务注入。"
-        return
-    }
+    [[ -z "$workdir" ]] && { err "环境未注册。"; return; }
 
     local cron_script="${workdir}/cron_backup.sh"
     local script_path
     script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 
     echo " 1) 基于固定分钟步长（推荐策略：10/15/20/30/60）"
-    echo " 2) 基于绝对时间锚点（例如：每日 04:30 宕机低谷期）"
+    echo " 2) 基于绝对时间锚点（例如：每日 04:30）"
     echo " 3) 剥离当前定时轮询机制"
 
     read -r -p "下达策略编号 [1/2/3]: " cron_type
-
     local cron_spec=""
 
     case "$cron_type" in
         1)
             read -r -p "输入步长(分钟): " min_interval
-            [[ "$min_interval" =~ ^[0-9]+$ ]] || {
-                err "参数非整型数字"
-                return
-            }
+            [[ "$min_interval" =~ ^[0-9]+$ ]] || { err "非法参数"; return; }
             cron_spec="*/${min_interval} * * * *"
         ;;
         2)
             read -r -p "输入时间锚点 (HH:MM): " cron_time
             local hour="${cron_time%:*}"
             local minute="${cron_time#*:}"
-            [[ "$hour" =~ ^[0-9]+$ && "$minute" =~ ^[0-9]+$ ]] || {
-                err "时间戳解析失败"
-                return
-            }
+            [[ "$hour" =~ ^[0-9]+$ && "$minute" =~ ^[0-9]+$ ]] || { err "解析失败"; return; }
             cron_spec="${minute} ${hour} * * *"
         ;;
         3)
             crontab -l 2>/dev/null | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d" | crontab - 2>/dev/null || true
             rm -f "$cron_script"
-            info "轮询钩子已安全卸载。"
+            info "轮询钩子已卸载。"
             return
         ;;
-        *)
-            err "指令越界"
-            return
-        ;;
+        *) err "指令越界"; return ;;
     esac
 
-    cat > "$cron_script" <<EOF
+    cat > "$cron_script" <<CRONEOF
 #!/usr/bin/env bash
 bash "$script_path" run-backup >> "$BACKUP_LOG" 2>&1
-EOF
+CRONEOF
 
     chmod +x "$cron_script"
 
-    # 清洗旧规则并注入新规则
     (
         crontab -l 2>/dev/null | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d"
         echo "$CRON_TAG_BEGIN"
@@ -437,8 +416,7 @@ EOF
 
 clean_all_dujiaonext() {
     docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-    # 彻底清理孤儿网络
-    docker network prune -f 2>/dev/null || true 
+    docker network prune -f 2>/dev/null || true
 }
 
 uninstall_service() {
@@ -477,7 +455,7 @@ install_ftp() {
 main_menu() {
     clear
     echo "==================================================="
-    echo "               Dujiao-Next 一键管理                "
+    echo "               Dujiao-Next 深度控制终端            "
     echo "==================================================="
     local wd
     wd=$(get_workdir)
@@ -498,7 +476,7 @@ main_menu() {
     read -r -p "输入指令信道 [0-10]: " choice
 
     case "$choice" in
-        1) deploy_aiclient2api ;;
+        1) deploy_dujiao_next ;;
         2) upgrade_service ;;
         3) pause_service ;;
         4) restart_service ;;
@@ -526,3 +504,4 @@ else
         read -r -p "➤ 按下回车键重置至主控层..."
     done
 fi
+EOF
