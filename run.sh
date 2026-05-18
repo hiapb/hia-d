@@ -10,6 +10,7 @@ COMPOSE_FILE="docker-compose.yml"
 CRON_TAG_BEGIN="# DUJIAO_NEXT_BACKUP_BEGIN"
 CRON_TAG_END="# DUJIAO_NEXT_BACKUP_END"
 BACKUP_LOG="/var/log/dujiaonext_backup.log"
+SQLITE_MARK_FILE="/etc/dujiaonext_sqlite3_auto_installed"
 
 DEFAULT_API_PORT="39180"
 DEFAULT_USER_PORT="34567"
@@ -31,7 +32,59 @@ warn() { echo -e "\033[33m[WARN]\033[0m $1" >&2; }
 err()  { echo -e "\033[31m[ERROR]\033[0m $1" >&2; }
 die()  { echo -e "\033[31m[FATAL]\033[0m $1" >&2; exit 1; }
 
-require_cmd() { command -v "$1" >/dev/null 2>&1 || die "系统缺少依赖: $1"; }
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "系统缺少依赖: $1"
+}
+
+ensure_sqlite3() {
+    if command -v sqlite3 >/dev/null 2>&1; then
+        return 0
+    fi
+
+    warn "未检测到 sqlite3，开始自动安装..."
+
+    if command -v apt >/dev/null 2>&1; then
+        apt update && apt install -y sqlite3 || die "sqlite3 安装失败。"
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update && apt-get install -y sqlite3 || die "sqlite3 安装失败。"
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y sqlite || die "sqlite3 安装失败。"
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y sqlite || die "sqlite3 安装失败。"
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache sqlite || die "sqlite3 安装失败。"
+    else
+        die "无法自动安装 sqlite3，请手动安装。"
+    fi
+
+    touch "$SQLITE_MARK_FILE"
+    info "sqlite3 已安装。"
+}
+
+uninstall_sqlite3_if_auto_installed() {
+    if [[ ! -f "$SQLITE_MARK_FILE" ]]; then
+        return 0
+    fi
+
+    warn "检测到 sqlite3 是本脚本自动安装的，准备卸载 sqlite3..."
+
+    if command -v apt >/dev/null 2>&1; then
+        apt remove -y sqlite3 >/dev/null 2>&1 || true
+        apt autoremove -y >/dev/null 2>&1 || true
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get remove -y sqlite3 >/dev/null 2>&1 || true
+        apt-get autoremove -y >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf remove -y sqlite >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+        yum remove -y sqlite >/dev/null 2>&1 || true
+    elif command -v apk >/dev/null 2>&1; then
+        apk del sqlite >/dev/null 2>&1 || true
+    fi
+
+    rm -f "$SQLITE_MARK_FILE"
+    info "sqlite3 自动安装记录已清理。"
+}
 
 get_local_ip() {
     hostname -I 2>/dev/null | awk '{print $1}'
@@ -397,6 +450,7 @@ deploy_dujiao_next() {
     require_cmd tar
     require_cmd openssl
     require_cmd python3
+    ensure_sqlite3
 
     local dc_cmd
     dc_cmd="$(docker_compose_cmd)"
@@ -457,6 +511,8 @@ upgrade_service() {
     local workdir
     workdir="$(get_workdir)"
     [[ -z "$workdir" ]] && { err "未找到部署记录。"; return; }
+
+    ensure_sqlite3
 
     cd "$workdir" || return
 
@@ -537,6 +593,8 @@ restore_backup() {
     local workdir
     workdir="$(get_workdir)"
 
+    ensure_sqlite3
+
     local search_dir="${workdir:-$DEFAULT_INSTALL_PATH}/backups"
     local default_backup
     default_backup="$(ls -t "${search_dir}"/dujiaonext_backup_*.tar.gz 2>/dev/null | head -n 1 || true)"
@@ -549,8 +607,9 @@ restore_backup() {
         return
     }
 
-    local safe_backup="/tmp/dujiaonext_restore_$(date +%s).tar.gz"
-    cp "$path" "$safe_backup" || die "复制备份到临时目录失败。"
+    mkdir -p /root/dujiaonext-backups-safe
+    local safe_backup="/root/dujiaonext-backups-safe/$(basename "$path")"
+    cp -f "$path" "$safe_backup" || die "复制备份到安全目录失败。"
 
     read -r -p "恢复目标目录 [回车默认: $DEFAULT_INSTALL_PATH]: " target_dir
     local wd="${target_dir:-$DEFAULT_INSTALL_PATH}"
@@ -560,9 +619,10 @@ restore_backup() {
     local old_dir="${wd}.before_restore_${timestamp}"
 
     if [[ -d "$wd" ]]; then
+        warn "目标目录已存在，不会删除。"
         read -r -p "是否停止服务并把当前目录改名为 ${old_dir} 后恢复？(y/N): " confirm
+
         [[ ! "$confirm" =~ ^[Yy]$ ]] && {
-            rm -f "$safe_backup"
             warn "已取消恢复。"
             return
         }
@@ -574,24 +634,16 @@ restore_backup() {
             }
         fi
 
-        mv "$wd" "$old_dir" || {
-            rm -f "$safe_backup"
-            die "旧目录改名失败，未执行恢复。"
-        }
-
+        mv "$wd" "$old_dir" || die "旧目录改名失败，未执行恢复。"
         info "旧目录已保留: ${old_dir}"
     fi
 
     mkdir -p "$wd"
 
-    tar -xzf "$safe_backup" -C "$wd" || {
-        rm -f "$safe_backup"
-        die "解压备份失败。"
-    }
+    tar -xzf "$safe_backup" -C "$wd" || die "解压备份失败。"
 
     mkdir -p "$wd/backups"
-    cp "$safe_backup" "$wd/backups/$(basename "$path")" 2>/dev/null || true
-    rm -f "$safe_backup"
+    cp -f "$safe_backup" "$wd/backups/$(basename "$safe_backup")" 2>/dev/null || true
 
     echo "$wd" > "$ENV_RECORD_FILE"
 
@@ -680,6 +732,169 @@ EOF
     info "定时备份已设置: ${cron_spec}"
 }
 
+manage_goods_sold_count() {
+    local workdir
+    workdir="$(get_workdir)"
+
+    [[ -z "$workdir" ]] && {
+        err "未发现部署环境。"
+        return
+    }
+
+    ensure_sqlite3
+
+    local db_file
+    db_file="$(find "$workdir/data/db" -type f \( -name "*.db" -o -name "*.sqlite" -o -name "*.sqlite3" \) 2>/dev/null | head -n 1)"
+
+    [[ -z "$db_file" || ! -f "$db_file" ]] && {
+        err "未找到 SQLite 数据库文件。"
+        echo "搜索目录: $workdir/data/db"
+        return
+    }
+
+    info "数据库文件: $db_file"
+
+    local goods_table
+    goods_table="$(sqlite3 "$db_file" "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('goods','products','product','items') LIMIT 1;")"
+
+    [[ -z "$goods_table" ]] && {
+        err "未找到商品表。"
+        echo "当前数据库表："
+        sqlite3 "$db_file" ".tables"
+        return
+    }
+
+    local sold_col=""
+    for col in sold_count sold sales sales_count sold_num volume sales_volume; do
+        if sqlite3 "$db_file" "PRAGMA table_info($goods_table);" | awk -F'|' '{print $2}' | grep -qx "$col"; then
+            sold_col="$col"
+            break
+        fi
+    done
+
+    [[ -z "$sold_col" ]] && {
+        err "未找到已售数量字段。"
+        echo "商品表字段："
+        sqlite3 "$db_file" "PRAGMA table_info($goods_table);"
+        return
+    }
+
+    local name_col=""
+    for col in name title goods_name product_name; do
+        if sqlite3 "$db_file" "PRAGMA table_info($goods_table);" | awk -F'|' '{print $2}' | grep -qx "$col"; then
+            name_col="$col"
+            break
+        fi
+    done
+
+    [[ -z "$name_col" ]] && {
+        err "未找到商品名称字段。"
+        echo "商品表字段："
+        sqlite3 "$db_file" "PRAGMA table_info($goods_table);"
+        return
+    }
+
+    local category_col=""
+    for col in category_id cate_id group_id class_id; do
+        if sqlite3 "$db_file" "PRAGMA table_info($goods_table);" | awk -F'|' '{print $2}' | grep -qx "$col"; then
+            category_col="$col"
+            break
+        fi
+    done
+
+    local category_table=""
+    for tbl in categories category goods_categories goods_category product_categories product_category; do
+        if sqlite3 "$db_file" "SELECT name FROM sqlite_master WHERE type='table' AND name='$tbl';" | grep -qx "$tbl"; then
+            category_table="$tbl"
+            break
+        fi
+    done
+
+    local category_name_col=""
+    if [[ -n "$category_table" ]]; then
+        for col in name title category_name cate_name; do
+            if sqlite3 "$db_file" "PRAGMA table_info($category_table);" | awk -F'|' '{print $2}' | grep -qx "$col"; then
+                category_name_col="$col"
+                break
+            fi
+        done
+    fi
+
+    echo ""
+    echo "==================================================="
+    echo "              修改商品已售数量"
+    echo "==================================================="
+
+    local selected_category=""
+
+    if [[ -n "$category_table" && -n "$category_col" && -n "$category_name_col" ]]; then
+        echo "分类列表："
+        echo "---------------------------------------------------"
+        sqlite3 -header -column "$db_file" "SELECT id AS 分类ID, $category_name_col AS 分类名称 FROM $category_table ORDER BY id ASC;"
+        echo "---------------------------------------------------"
+        read -r -p "请输入分类ID: " selected_category
+
+        [[ ! "$selected_category" =~ ^[0-9]+$ ]] && {
+            err "分类ID非法。"
+            return
+        }
+
+        echo ""
+        echo "商品列表："
+        echo "---------------------------------------------------"
+        sqlite3 -header -column "$db_file" "SELECT id AS 商品ID, $name_col AS 商品名称, $sold_col AS 已售数量 FROM $goods_table WHERE $category_col=$selected_category ORDER BY id ASC;"
+    else
+        warn "未识别到分类表或分类字段，将列出全部商品。"
+        echo ""
+        echo "商品列表："
+        echo "---------------------------------------------------"
+        sqlite3 -header -column "$db_file" "SELECT id AS 商品ID, $name_col AS 商品名称, $sold_col AS 已售数量 FROM $goods_table ORDER BY id ASC;"
+    fi
+
+    echo "---------------------------------------------------"
+
+    read -r -p "请输入要修改的商品ID: " goods_id
+    [[ ! "$goods_id" =~ ^[0-9]+$ ]] && {
+        err "商品ID非法。"
+        return
+    }
+
+    local exists
+    if [[ -n "$selected_category" && -n "$category_col" ]]; then
+        exists="$(sqlite3 "$db_file" "SELECT COUNT(*) FROM $goods_table WHERE id=$goods_id AND $category_col=$selected_category;")"
+    else
+        exists="$(sqlite3 "$db_file" "SELECT COUNT(*) FROM $goods_table WHERE id=$goods_id;")"
+    fi
+
+    [[ "$exists" != "1" ]] && {
+        err "商品不存在。"
+        return
+    }
+
+    local current_info
+    current_info="$(sqlite3 "$db_file" "SELECT $name_col || ' 当前已售: ' || $sold_col FROM $goods_table WHERE id=$goods_id;")"
+    echo "$current_info"
+
+    read -r -p "请输入新的已售数量: " new_sold
+    [[ ! "$new_sold" =~ ^[0-9]+$ ]] && {
+        err "已售数量必须是非负整数。"
+        return
+    }
+
+    sqlite3 "$db_file" "UPDATE $goods_table SET $sold_col=$new_sold WHERE id=$goods_id;" || {
+        err "修改失败。"
+        return
+    }
+
+    info "修改完成。"
+
+    echo ""
+    sqlite3 -header -column "$db_file" "SELECT id AS 商品ID, $name_col AS 商品名称, $sold_col AS 已售数量 FROM $goods_table WHERE id=$goods_id;"
+
+    docker restart "$API_CONTAINER" >/dev/null 2>&1 || true
+    docker restart "$USER_GATEWAY_CONTAINER" >/dev/null 2>&1 || true
+}
+
 uninstall_service() {
     local workdir
     workdir="$(get_workdir)"
@@ -713,6 +928,9 @@ uninstall_service() {
     crontab -l 2>/dev/null | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d" | crontab - 2>/dev/null || true
 
     docker system prune -f >/dev/null 2>&1 || true
+
+    uninstall_sqlite3_if_auto_installed
+
     info "卸载完成。"
 }
 
@@ -790,10 +1008,11 @@ main_menu() {
     echo "  9) FTP/SFTP 备份工具"
     echo " 10) 重置后台密码"
     echo " 11) 查看状态和日志"
+    echo " 12) 修改商品已售数量"
     echo "  0) 退出"
     echo "==================================================="
 
-    read -r -p "请输入选项 [0-11]: " choice
+    read -r -p "请输入选项 [0-12]: " choice
 
     case "$choice" in
         1) deploy_dujiao_next ;;
@@ -807,6 +1026,7 @@ main_menu() {
         9) install_ftp ;;
         10) reset_admin_password ;;
         11) show_logs ;;
+        12) manage_goods_sold_count ;;
         0) info "已退出。"; exit 0 ;;
         *) warn "无效选项。" ;;
     esac
