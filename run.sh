@@ -345,10 +345,27 @@ redis_block = f"""redis:
   db: 0
 """
 
+queue_block = f"""queue:
+  enabled: true
+  host: redis
+  port: 6379
+  password: {redis_pass}
+  db: 1
+  concurrency: 10
+  queues:
+    critical: 5
+    default: 10
+"""
+
 if re.search(r'(?m)^redis:\s*$', text):
     text = re.sub(r'(?ms)^redis:\s*\n(?:^[ \t]+.*\n?)*', redis_block, text, count=1)
 else:
     text += "\n\n" + redis_block
+
+if re.search(r'(?m)^queue:\s*$', text):
+    text = re.sub(r'(?ms)^queue:\s*\n(?:^[ \t]+.*\n?)*', queue_block, text, count=1)
+else:
+    text += "\n\n" + queue_block
 
 text = re.sub(r'(?m)^(\s*host:\s*)(127\.0\.0\.1|localhost)\s*$', r'\1redis', text)
 text = re.sub(r'(?m)^(\s*driver:\s*)(mysql|postgres|postgresql)\s*$', r'\1sqlite', text)
