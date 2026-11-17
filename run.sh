@@ -881,7 +881,7 @@ except Exception as exc:
 PYBACKUP
 )" || return 1
     LAST_BACKUP_FILE="$result"
-    info "备份完成：${LAST_BACKUP_FILE}（只保留最近 ${BACKUP_KEEP} 份）"
+    info "备份完成：${LAST_BACKUP_FILE}"
 }
 
 restore_backup() {
@@ -1407,10 +1407,10 @@ main_menu() {
     echo -e " 当前安装目录: \033[36m${wd:-未部署}\033[0m"
     echo "---------------------------------------------------"
     echo "  1) 一键部署"
-    echo "  2) 升级服务（自动备份，保留 3 份）"
+    echo "  2) 升级服务"
     echo "  3) 停止服务"
     echo "  4) 重启服务"
-    echo "  5) 手动备份（保留 3 份）"
+    echo "  5) 手动备份"
     echo "  6) 恢复备份"
     echo "  7) 定时备份"
     echo "  8) 完全卸载"
