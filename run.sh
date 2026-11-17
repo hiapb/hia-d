@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 
 set -o pipefail
+umask 077
+BACKUP_KEEP=3
+PYTHON=python3
+CONFIG_TEMPLATE_TAG="v1.5.2"
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 DEFAULT_INSTALL_PATH="/opt/dujiao-next"
@@ -106,13 +110,85 @@ docker_compose_cmd() {
 }
 
 compose_run() {
-    local dc_cmd
-    dc_cmd="$(docker_compose_cmd)"
-    $dc_cmd --env-file .env -f "$COMPOSE_FILE" "$@"
+    if docker compose version >/dev/null 2>&1; then
+        docker compose --env-file .env -f "$COMPOSE_FILE" "$@"
+    elif command -v docker-compose >/dev/null 2>&1; then
+        docker-compose --env-file .env -f "$COMPOSE_FILE" "$@"
+    else
+        err "未检测到 Docker Compose。"
+        return 1
+    fi
 }
 
 get_workdir() {
     [[ -f "$ENV_RECORD_FILE" ]] && cat "$ENV_RECORD_FILE" || echo ""
+}
+
+
+ensure_yaml() {
+    require_cmd python3
+    if python3 -c 'import yaml' >/dev/null 2>&1; then
+        PYTHON=python3
+        return 0
+    fi
+    info "安装 Python YAML 依赖..."
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update && apt-get install -y python3-yaml || return 1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y python3-pyyaml || return 1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y python3-pyyaml || return 1
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache py3-yaml || return 1
+    else
+        err "请先安装 PyYAML：当前系统 Python 需要能执行 import yaml。"
+        return 1
+    fi
+    python3 -c 'import yaml' || return 1
+    PYTHON=python3
+}
+
+read_env_value() {
+    python3 - "$1" "$2" <<'PYENV'
+import sys
+from pathlib import Path
+for line in Path(sys.argv[1]).read_text().splitlines():
+    key, sep, value = line.partition('=')
+    if sep and key.strip() == sys.argv[2]:
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        print(value)
+        break
+PYENV
+}
+
+
+refresh_backup_runner() {
+    local workdir="$1" manager="${1}/manager.sh" source_path
+    source_path="${BASH_SOURCE[0]}"
+    [[ -f "$source_path" ]] || { err "请把管理脚本保存为文件后运行。"; return 1; }
+    if [[ "$source_path" != "$manager" ]] && ! [[ "$source_path" -ef "$manager" ]]; then
+        cp "$source_path" "$manager" || return 1
+    fi
+    chmod 700 "$manager" || return 1
+    printf '#!/usr/bin/env bash\nexec bash %q run-backup >> %q 2>&1\n' \
+        "$manager" "$BACKUP_LOG" > "${workdir}/cron_backup.sh" || return 1
+    chmod 700 "${workdir}/cron_backup.sh"
+}
+
+with_deploy_lock() {
+    local workdir
+    workdir="$(get_workdir)"
+    [[ -n "$workdir" && -d "$workdir" && "$workdir" != / ]] || {
+        err "未找到有效的部署目录。"
+        return 1
+    }
+    require_cmd flock
+    (
+        flock -w 30 9 || { err "另一个管理或备份任务正在运行，请稍后重试。"; exit 1; }
+        "$@" "$workdir"
+    ) 9>"${workdir}/.manager.lock"
 }
 
 generate_passwords() {
@@ -313,70 +389,171 @@ EOF
 }
 
 download_config() {
-    local workdir="$1"
-    local cfg="${workdir}/config/config.yml"
-
-    if [[ -f "$cfg" ]]; then
-        return
+    local workdir="$1" cfg="${1}/config/config.yml" tmp
+    [[ -f "$cfg" ]] && return 0
+    tmp="$(mktemp "${workdir}/config/.download-XXXXXX")" || return 1
+    if ! curl -fsSL --connect-timeout 10 --max-time 60 \
+        "https://raw.githubusercontent.com/dujiao-next/dujiao-next/${CONFIG_TEMPLATE_TAG}/config.yml.example" -o "$tmp"; then
+        rm -f "$tmp"
+        err "下载配置模板失败。"
+        return 1
     fi
-
-    curl -fsSL https://raw.githubusercontent.com/dujiao-next/dujiao-next/main/config.yml.example -o "$cfg" \
-        || die "下载 config.yml.example 失败。"
+    mv -f "$tmp" "$cfg"
 }
 
 patch_config_yml() {
-    local workdir="$1"
-    local cfg="${workdir}/config/config.yml"
-    [[ -f "$cfg" ]] || die "config.yml 不存在。"
+    local workdir="$1" phase="${2:-upgrade}"
+    "$PYTHON" - "$workdir" "$phase" <<'PYCONFIG'
+import os, secrets, sqlite3, sys, tempfile
+from pathlib import Path
+from urllib.parse import quote
+import yaml
 
-    python3 - "$cfg" "$REDIS_PASS" <<'PYEOF'
-import sys, re, secrets, string
+class StrictLoader(yaml.SafeLoader):
+    pass
 
-path = sys.argv[1]
-redis_pass = sys.argv[2]
+def mapping(loader, node, deep=False):
+    result = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in result:
+            raise ValueError('YAML 配置含重复字段：' + str(key))
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+StrictLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
 
-text = open(path, "r", encoding="utf-8").read()
-text = text.replace("\r\n", "\n").replace("\r", "\n")
+def main():
+    wd = Path(sys.argv[1]).resolve()
+    phase = sys.argv[2]
+    path = wd / 'config/config.yml'
+    cfg = yaml.load(path.read_text(encoding='utf-8-sig'), Loader=StrictLoader)
+    if not isinstance(cfg, dict):
+        raise ValueError('config.yml 顶层必须是 YAML 对象')
+    def section(key):
+        value = cfg.setdefault(key, {})
+        if not isinstance(value, dict):
+            raise ValueError(key + ' 配置必须是 YAML 对象')
+        return value
+    # 不重新下载覆盖已有配置，不对 host、dsn 等字段做全局正则替换。
+    for key in ('server', 'database'):
+        if key not in cfg or not isinstance(cfg[key], dict):
+            raise ValueError('缺少关键配置 '+key+'；请从完整备份恢复 config.yml 后重试')
+    server, database = section('server'), section('database')
+    if str(server.get('port', 8080)) != '8080':
+        raise ValueError('此 Docker 部署要求 server.port=8080，请核对容器和网关端口配置')
+    server['host'] = '0.0.0.0'
+    if str(database.get('driver', 'sqlite')).lower() != 'sqlite':
+        raise ValueError('检测到非 SQLite 数据库；脚本不会把现有数据库改成 SQLite')
+    database['driver'] = 'sqlite'
+    dsn = str(database.get('dsn', './db/dujiao.db'))
+    db_base = (wd / 'data/db').resolve()
+    if dsn.startswith('/app/db/'):
+        db_path = db_base / dsn[len('/app/db/'):]
+    elif dsn.startswith(('./db/', 'db/')):
+        db_path = db_base / (dsn[2:] if dsn.startswith('./') else dsn)[3:]
+    else:
+        raise ValueError('无法确认 SQLite 数据库挂载路径：'+dsn)
+    db_path = db_path.resolve()
+    if db_base not in db_path.parents:
+        raise ValueError('SQLite 数据库路径超出 data/db，已停止')
+    if phase != 'install' and not db_path.is_file():
+        raise ValueError('没有找到现有数据库 '+str(db_path)+'，已停止，避免启动一个空库')
 
-redis_block = f"""redis:
-  host: redis
-  port: 6379
-  password: {redis_pass}
-  db: 0
-"""
+    env = {}
+    for line in (wd/'.env').read_text().splitlines():
+        k, sep, v = line.partition('=')
+        if sep:
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            env[k.strip()] = v
+    password = env.get('REDIS_PASSWORD', '')
+    if not password:
+        raise ValueError('.env 中 REDIS_PASSWORD 为空，已停止')
+    if '$' in password:
+        raise ValueError('REDIS_PASSWORD 含 $，请先核对 Compose 插值后的真实密码')
+    for key, db in (('redis',0),('queue',1)):
+        block = section(key)
+        block.update(host='redis', port=6379, password=password)
+        block.setdefault('enabled', True)
+        block.setdefault('db', db)
+    section('queue').setdefault('concurrency', 10)
+    section('queue').setdefault('queues', {'default':10, 'critical':5})
 
-queue_block = f"""queue:
-  enabled: true
-  host: redis
-  port: 6379
-  password: {redis_pass}
-  db: 1
-  concurrency: 10
-  queues:
-    critical: 5
-    default: 10
-"""
-
-if re.search(r'(?m)^redis:\s*$', text):
-    text = re.sub(r'(?ms)^redis:\s*\n(?:^[ \t]+.*\n?)*', redis_block, text, count=1)
-else:
-    text += "\n\n" + redis_block
-
-if re.search(r'(?m)^queue:\s*$', text):
-    text = re.sub(r'(?ms)^queue:\s*\n(?:^[ \t]+.*\n?)*', queue_block, text, count=1)
-else:
-    text += "\n\n" + queue_block
-
-text = re.sub(r'(?m)^(\s*host:\s*)(127\.0\.0\.1|localhost)\s*$', r'\1redis', text)
-text = re.sub(r'(?m)^(\s*driver:\s*)(mysql|postgres|postgresql)\s*$', r'\1sqlite', text)
-text = re.sub(r'(?m)^(\s*dsn:\s*).+$', r'\1/app/db/dujiao.db', text)
-
-alphabet = string.ascii_letters + string.digits
-secret = ''.join(secrets.choice(alphabet) for _ in range(48))
-text = re.sub(r'(?m)^(\s*secret:\s*)(your.*|change.*|please.*)$', r'\1' + secret, text)
-
-open(path, "w", encoding="utf-8", newline="\n").write(text)
-PYEOF
+    def weak(value):
+        return (not isinstance(value,str) or len(value)<32 or
+                any(x in value.lower() for x in
+                    ('change-me','change-in-production','your-secret-key')))
+    app = section('app')
+    app_secret = app.get('secret_key', 'change-me-32-byte-secret-key!!')
+    if weak(app_secret):
+        # 旧 app 密钥还用于 2FA、上游/渠道凭证和游客订单摘要。
+        # 仅在没有依赖旧密钥的数据时自动更换；不修改任何数据库记录。
+        if db_path.exists():
+            uri = 'file:' + quote(str(db_path), safe='/') + '?mode=ro'
+            conn = sqlite3.connect(uri, uri=True, timeout=10)
+            try:
+                if conn.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
+                    raise ValueError('现有 SQLite 数据库检查失败')
+                tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                protected = {
+                    'admins': ('totp_secret',), 'users': ('totp_secret',),
+                    'site_connections': ('api_secret',),
+                    'channel_clients': ('channel_secret','bot_token'),
+                }
+                for table, fields in protected.items():
+                    if table not in tables:
+                        continue
+                    cols = {r[1] for r in conn.execute('PRAGMA table_info("'+table+'")')}
+                    for field in fields:
+                        if field in cols and conn.execute(
+                            'SELECT 1 FROM "'+table+'" WHERE "'+field+'" IS NOT NULL '
+                            'AND "'+field+'" <> ? LIMIT 1', ('',)).fetchone():
+                            raise ValueError('弱 app.secret_key 已用于历史数据 '+table+'.'+field+
+                                             '。已保留旧密钥；需要迁移这些数据后才能升级')
+                if 'orders' in tables:
+                    cols = {r[1] for r in conn.execute('PRAGMA table_info("orders")')}
+                    if 'guest_password' in cols and conn.execute(
+                        "SELECT 1 FROM orders WHERE guest_password LIKE 'hmac-sha256:%' LIMIT 1").fetchone():
+                        raise ValueError('旧 app.secret_key 已用于游客订单密码摘要，不能直接更换；需要应用支持密钥迁移')
+            finally:
+                conn.close()
+        app_secret = secrets.token_hex(32)
+        app['secret_key'] = app_secret
+        print('[INFO] 已生成独立的 app.secret_key；未发现依赖旧密钥的历史数据。')
+    used = {app_secret.strip()}
+    for key in ('jwt','user_jwt'):
+        block = section(key)
+        value = block.get('secret','')
+        if weak(value) or value.strip() in used:
+            value = secrets.token_hex(32)
+            while value.strip() in used:
+                value = secrets.token_hex(32)
+            block['secret'] = value
+            print('[INFO] 已修复 '+key+'.secret，对应账号需要重新登录。')
+        used.add(value.strip())
+    rendered = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)
+    # PyYAML 重新序列化会去掉注释，但保留未修改的配置字段和值。
+    if yaml.load(rendered, Loader=StrictLoader) != cfg:
+        raise ValueError('YAML 写入校验失败')
+    fd, temp_path = tempfile.mkstemp(prefix='.config-', suffix='.yml', dir=path.parent)
+    try:
+        with os.fdopen(fd,'w',encoding='utf-8') as stream:
+            stream.write(rendered)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temp_path, path.stat().st_mode & 0o777)
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+    print('[INFO] 配置校验通过，合格的现有密钥保持不变。')
+try:
+    main()
+except Exception as exc:
+    print('[ERROR] 配置检查失败：'+str(exc), file=sys.stderr)
+    sys.exit(1)
+PYCONFIG
 }
 
 write_env_file() {
@@ -440,21 +617,28 @@ show_access() {
 }
 
 wait_app_ready() {
-    local port
-    port="$(grep -oP '^API_PORT=\K.*' .env 2>/dev/null || echo "$DEFAULT_API_PORT")"
-
-    info "等待 API 启动..."
-
-    for i in {1..60}; do
-        if curl -fsSL "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
-            info "API 已就绪。"
-            return 0
+    local port state i
+    port="$(read_env_value .env API_PORT)"
+    port="${port:-$DEFAULT_API_PORT}"
+    info "等待 API 启动，最多检测 40 次..."
+    for i in {1..40}; do
+        state="$(docker inspect -f '{{.State.Running}} {{.State.Restarting}}' "$API_CONTAINER" 2>/dev/null)"
+        if [[ "$state" == 'true false' ]]; then
+            if docker exec "$API_CONTAINER" wget -q -T 2 -O /dev/null \
+                http://127.0.0.1:8080/health 2>/dev/null; then
+                info "API 已就绪。"
+                return 0
+            fi
+            if curl -fsS --connect-timeout 1 --max-time 2 \
+                "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+                info "API 已就绪。"
+                return 0
+            fi
         fi
         sleep 2
     done
-
-    warn "服务可能没有正常启动，最近日志如下："
-    docker logs --tail=120 "$API_CONTAINER" 2>/dev/null || true
+    err "API 未通过健康检查，最近日志如下："
+    docker logs --tail=100 "$API_CONTAINER" 2>&1 || true
     return 1
 }
 
@@ -467,6 +651,7 @@ deploy_dujiao_next() {
     require_cmd tar
     require_cmd openssl
     require_cmd python3
+    ensure_yaml || return 1
     ensure_sqlite3
 
     local dc_cmd
@@ -513,37 +698,59 @@ deploy_dujiao_next() {
     write_env_file "$install_path" "$api_port" "$user_port" "$admin_port" "$user_bind_ip" "$admin_bind_ip"
     create_compose_file "$install_path"
     create_nginx_files "$install_path"
-    download_config "$install_path"
-    patch_config_yml "$install_path"
+    download_config "$install_path" || return 1
+    patch_config_yml "$install_path" install || return 1
 
     info "拉取官方镜像并启动..."
     $dc_cmd --env-file .env -f "$COMPOSE_FILE" pull || die "镜像拉取失败。"
     $dc_cmd --env-file .env -f "$COMPOSE_FILE" up -d --force-recreate || die "服务启动失败。"
 
-    wait_app_ready || true
+    wait_app_ready || return 1
     show_access "$install_path"
 }
 
 upgrade_service() {
-    local workdir
-    workdir="$(get_workdir)"
-    [[ -z "$workdir" ]] && { err "未找到部署记录。"; return; }
+    require_cmd docker
+    require_cmd curl
+    require_cmd python3
+    require_cmd tar
+    ensure_yaml || return 1
+    with_deploy_lock upgrade_locked
+}
 
-    ensure_sqlite3
-
-    cd "$workdir" || return
-
-    REDIS_PASS="$(grep -oP '^REDIS_PASSWORD=\K.*' .env 2>/dev/null || true)"
-    [[ -n "$REDIS_PASS" ]] && patch_config_yml "$workdir"
-
-    create_nginx_files "$workdir"
-    create_compose_file "$workdir"
-
-    info "开始升级..."
-    compose_run pull || die "镜像拉取失败。"
-    compose_run up -d --force-recreate || die "服务重建失败。"
-
-    wait_app_ready || true
+upgrade_locked() {
+    local workdir="$1" was_running
+    cd "$workdir" || return 1
+    [[ -f .env && -f "$COMPOSE_FILE" && -f config/config.yml ]] || {
+        err "现有部署文件不完整，已停止升级。"
+        return 1
+    }
+    # 在下载镜像、改配置和重建服务前，先生成一份完整备份。
+    backup_locked "$workdir" || { err "备份失败，未执行升级。"; return 1; }
+    if command -v crontab >/dev/null 2>&1 && \
+        crontab -l 2>/dev/null | grep -qFx "$CRON_TAG_BEGIN"; then
+        refresh_backup_runner "$workdir" || warn "定时备份脚本更新失败，请通过选项 7 重新设置。"
+    fi
+    compose_run config -q || { err "Compose 配置校验失败，未执行升级。"; return 1; }
+    info "拉取镜像..."
+    compose_run pull || { err "镜像拉取失败，现有服务未重建。"; return 1; }
+    was_running="$(docker inspect -f '{{.State.Running}}' "$API_CONTAINER" 2>/dev/null)"
+    compose_run stop api || { err "无法停止 API，未修改配置。"; return 1; }
+    if ! patch_config_yml "$workdir" upgrade; then
+        [[ "$was_running" == true ]] && compose_run start api
+        err "配置修复未完成，已停止升级；原配置未被覆盖。"
+        return 1
+    fi
+    # 沿用已有 Compose 和 Nginx 配置，避免覆盖手动修改；重建网关刷新服务 IP。
+    compose_run up -d --force-recreate || {
+        err "容器重建失败。升级前备份：${LAST_BACKUP_FILE}"
+        return 1
+    }
+    if ! wait_app_ready; then
+        err "升级未成功。升级前备份：${LAST_BACKUP_FILE}"
+        return 1
+    fi
+    info "升级成功。升级前备份：${LAST_BACKUP_FILE}"
     show_access "$workdir"
 }
 
@@ -557,53 +764,124 @@ pause_service() {
 }
 
 restart_service() {
-    local workdir
-    workdir="$(get_workdir)"
-    [[ -z "$workdir" ]] && { err "未发现部署环境。"; return; }
+    with_deploy_lock restart_locked
+}
 
-    cd "$workdir" || return
-
-    REDIS_PASS="$(grep -oP '^REDIS_PASSWORD=\K.*' .env 2>/dev/null || true)"
-    [[ -n "$REDIS_PASS" ]] && patch_config_yml "$workdir"
-
-    create_nginx_files "$workdir"
-    create_compose_file "$workdir"
-
-    compose_run up -d --force-recreate
-    wait_app_ready || true
+restart_locked() {
+    local workdir="$1"
+    cd "$workdir" || return 1
+    # 重启不修改密钥、配置文件或数据库。
+    compose_run restart api redis user admin || return 1
+    wait_app_ready || return 1
+    compose_run restart user-gateway admin-gateway || return 1
     show_access "$workdir"
 }
 
 do_backup() {
-    local workdir
-    workdir="$(get_workdir)"
-    [[ -z "$workdir" ]] && { err "未找到部署环境。"; return; }
+    require_cmd python3
+    require_cmd tar
+    with_deploy_lock backup_locked
+}
 
-    local backup_dir="${workdir}/backups"
-    mkdir -p "$backup_dir"
+backup_locked() {
+    local workdir="$1" result
+    result="$(python3 - "$workdir" "$BACKUP_KEEP" <<'PYBACKUP'
+import datetime, gzip, json, os, shutil, sqlite3, sys, tarfile, tempfile, time
+from pathlib import Path
+from urllib.parse import quote
 
-    local timestamp
-    timestamp="$(date +"%Y%m%d_%H%M%S")"
-
-    local temp_dir="/tmp/dujiaonext_backup_tmp_${timestamp}"
-    rm -rf "$temp_dir"
-    mkdir -p "$temp_dir"
-
-    cp "${workdir}/${COMPOSE_FILE}" "${temp_dir}/" 2>/dev/null || true
-    cp "${workdir}/.env" "${temp_dir}/" 2>/dev/null || true
-    [[ -d "${workdir}/config" ]] && cp -r "${workdir}/config" "${temp_dir}/config"
-    [[ -d "${workdir}/nginx" ]] && cp -r "${workdir}/nginx" "${temp_dir}/nginx"
-    [[ -d "${workdir}/data" ]] && cp -r "${workdir}/data" "${temp_dir}/data"
-
-    local backup_file="${backup_dir}/dujiaonext_backup_${timestamp}.tar.gz"
-
-    tar -czf "$backup_file" -C "$temp_dir" .
-    rm -rf "$temp_dir"
-
-    cd "$backup_dir" || return
-    ls -t dujiaonext_backup_*.tar.gz 2>/dev/null | awk 'NR>20' | xargs -r rm -f
-
-    info "备份完成: ${backup_file}"
+def main():
+    wd = Path(sys.argv[1]).resolve()
+    keep = int(sys.argv[2])
+    if keep < 1:
+        raise ValueError('备份保留份数必须大于零')
+    for required in ('.env','docker-compose.yml','config/config.yml'):
+        if not (wd/required).is_file():
+            raise ValueError('缺少部署文件：'+required)
+    dest = wd/'backups'
+    dest.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    final = dest/('dujiaonext_backup_'+stamp+'.tar.gz')
+    partial = dest/('.'+final.name+'.partial')
+    stage = Path(tempfile.mkdtemp(prefix='.backup-stage-', dir=dest))
+    try:
+        for name in ('docker-compose.yml','.env','cron_backup.sh','manager.sh'):
+            if (wd/name).is_file():
+                shutil.copy2(wd/name, stage/name)
+        for name in ('config','nginx'):
+            if (wd/name).is_dir():
+                shutil.copytree(wd/name, stage/name, symlinks=True)
+        if (wd/'data').is_dir():
+            # SQLite WAL/SHM 不直接复制；数据库使用官方在线备份接口生成一致快照。
+            def ignore(folder, names):
+                return [n for n in names if n.endswith(('-wal','-shm','-journal'))]
+            shutil.copytree(wd/'data', stage/'data', symlinks=True, ignore=ignore)
+            for original in (wd/'data').rglob('*'):
+                if not original.is_file() or original.is_symlink():
+                    continue
+                if original.name.endswith(('-wal','-shm','-journal')):
+                    continue
+                with original.open('rb') as stream:
+                    is_sqlite = stream.read(16) == b'SQLite format 3\x00'
+                if not is_sqlite:
+                    continue
+                copy = stage / original.relative_to(wd)
+                copy.unlink(missing_ok=True)
+                uri = 'file:' + quote(str(original),safe='/') + '?mode=ro'
+                src = sqlite3.connect(uri, uri=True, timeout=30)
+                dst = sqlite3.connect(str(copy))
+                deadline = time.monotonic()+180
+                def progress(*args):
+                    if time.monotonic()>deadline:
+                        raise TimeoutError('SQLite 备份超时：'+original.name)
+                try:
+                    src.backup(dst, pages=256, progress=progress, sleep=0.1)
+                    dst.commit()
+                    mode = dst.execute('PRAGMA journal_mode=DELETE').fetchone()[0]
+                    if mode.lower() != 'delete':
+                        raise ValueError('无法将备份转换为独立 SQLite 文件')
+                    if dst.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
+                        raise ValueError('SQLite 备份完整性检查失败：'+original.name)
+                finally:
+                    dst.close()
+                    src.close()
+                for suffix in ('-wal','-shm','-journal'):
+                    Path(str(copy)+suffix).unlink(missing_ok=True)
+        (stage/'backup_meta.json').write_text(json.dumps({
+            'created_at':datetime.datetime.now().astimezone().isoformat(),
+            'source':str(wd), 'keep':keep, 'sqlite_snapshot':True,
+        },ensure_ascii=False,indent=2), encoding='utf-8')
+        with tarfile.open(partial,'w:gz') as archive:
+            for item in sorted(stage.iterdir()):
+                archive.add(item, arcname=item.name, recursive=True)
+        # 完整读取 gzip 校验 CRC，再核对归档中关键文件。
+        with gzip.open(partial,'rb') as stream, open(os.devnull,'wb') as sink:
+            shutil.copyfileobj(stream,sink)
+        with tarfile.open(partial,'r:gz') as archive:
+            names = {m.name[2:] if m.name.startswith('./') else m.name for m in archive.getmembers()}
+            if not {'.env','docker-compose.yml','config/config.yml'} <= names:
+                raise ValueError('备份归档缺少关键文件')
+        os.chmod(partial,0o600)
+        os.replace(partial,final)
+        # 仅在新备份成功发布后轮换；三种备份共用同一目录和同一上限。
+        backups = sorted(dest.glob('dujiaonext_backup_*.tar.gz'),
+                         key=lambda p:(p.stat().st_mtime_ns,p.name), reverse=True)
+        for old in backups[keep:]:
+            old.unlink()
+        print(str(final))
+    finally:
+        if partial.exists():
+            partial.unlink()
+        shutil.rmtree(stage, ignore_errors=True)
+try:
+    main()
+except Exception as exc:
+    print('[ERROR] 备份失败：'+str(exc),file=sys.stderr)
+    sys.exit(1)
+PYBACKUP
+)" || return 1
+    LAST_BACKUP_FILE="$result"
+    info "备份完成：${LAST_BACKUP_FILE}（只保留最近 ${BACKUP_KEEP} 份）"
 }
 
 restore_backup() {
@@ -667,15 +945,14 @@ restore_backup() {
     cd "$wd" || return
     chmod -R 0777 data 2>/dev/null || true
 
-    REDIS_PASS="$(grep -oP '^REDIS_PASSWORD=\K.*' .env 2>/dev/null || true)"
-    [[ -n "$REDIS_PASS" ]] && patch_config_yml "$wd"
+    REDIS_PASS="$(read_env_value .env REDIS_PASSWORD)"
+    # 恢复保持备份原密钥和业务配置；有兼容问题时通过日志处理。
 
-    create_nginx_files "$wd"
-    create_compose_file "$wd"
+    [[ -f "$wd/$COMPOSE_FILE" ]] || { err "备份缺少 Compose 文件。"; return 1; }
 
     compose_run up -d --force-recreate || die "恢复后启动失败。"
 
-    wait_app_ready || true
+    wait_app_ready || return 1
     show_access "$wd"
 }
 
@@ -691,6 +968,7 @@ setup_auto_backup() {
     }
 
     local cron_script="${workdir}/cron_backup.sh"
+    local manager_script="${workdir}/manager.sh"
     local script_path
     script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 
@@ -711,13 +989,22 @@ setup_auto_backup() {
         2)
             read -r -p "输入间隔分钟数，例如 3/5/10/15/30/60: " min_interval
             [[ "$min_interval" =~ ^[0-9]+$ ]] || { err "分钟数非法。"; return; }
-            cron_spec="*/${min_interval} * * * *"
+            min_interval=$((10#$min_interval))
+            (( min_interval >= 1 && min_interval <= 60 )) || { err "分钟数需为 1 到 60。"; return 1; }
+            if [[ "$min_interval" == 60 ]]; then
+                cron_spec="0 * * * *"
+            else
+                cron_spec="*/${min_interval} * * * *"
+            fi
         ;;
         3)
             read -r -p "输入时间，例如 04:30: " cron_time
             local hour="${cron_time%:*}"
             local minute="${cron_time#*:}"
             [[ "$hour" =~ ^[0-9]+$ && "$minute" =~ ^[0-9]+$ ]] || { err "时间格式错误。"; return; }
+            hour=$((10#$hour))
+            minute=$((10#$minute))
+            (( hour <= 23 && minute <= 59 )) || { err "时间超出有效范围。"; return 1; }
             cron_spec="${minute} ${hour} * * *"
         ;;
         4)
@@ -732,17 +1019,12 @@ setup_auto_backup() {
         ;;
     esac
 
-    cat > "$cron_script" <<EOF
-#!/usr/bin/env bash
-bash "$script_path" run-backup >> "$BACKUP_LOG" 2>&1
-EOF
-
-    chmod +x "$cron_script"
+    refresh_backup_runner "$workdir" || return 1
 
     (
         crontab -l 2>/dev/null | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d"
         echo "$CRON_TAG_BEGIN"
-        echo "${cron_spec} bash ${cron_script}"
+        printf '%s bash "%s"\n' "$cron_spec" "$cron_script"
         echo "$CRON_TAG_END"
     ) | crontab -
 
@@ -1006,7 +1288,7 @@ manage_goods_sold_count() {
     info "正在清理缓存..."
 
     local redis_pass
-    redis_pass="$(grep -oP '^REDIS_PASSWORD=\K.*' "$workdir/.env" 2>/dev/null || true)"
+    redis_pass="$(read_env_value "$workdir/.env" REDIS_PASSWORD)"
 
     if [[ -n "$redis_pass" ]]; then
         docker exec "$REDIS_CONTAINER" redis-cli -a "$redis_pass" FLUSHALL >/dev/null 2>&1 || true
@@ -1086,7 +1368,7 @@ reset_admin_password() {
     sed -i "s/^DJ_DEFAULT_ADMIN_PASSWORD=.*/DJ_DEFAULT_ADMIN_PASSWORD=${new_pass}/" .env
 
     ADMIN_PASS="$new_pass"
-    REDIS_PASS="$(grep -oP '^REDIS_PASSWORD=\K.*' .env 2>/dev/null || true)"
+    REDIS_PASS="$(read_env_value .env REDIS_PASSWORD)"
     write_pwd_file "$workdir"
 
     warn "注意：默认后台密码通常只在首次初始化管理员时生效。"
@@ -1125,10 +1407,10 @@ main_menu() {
     echo -e " 当前安装目录: \033[36m${wd:-未部署}\033[0m"
     echo "---------------------------------------------------"
     echo "  1) 一键部署"
-    echo "  2) 升级服务"
+    echo "  2) 升级服务（自动备份，保留 3 份）"
     echo "  3) 停止服务"
     echo "  4) 重启服务"
-    echo "  5) 手动备份"
+    echo "  5) 手动备份（保留 3 份）"
     echo "  6) 恢复备份"
     echo "  7) 定时备份"
     echo "  8) 完全卸载"
@@ -1139,7 +1421,7 @@ main_menu() {
     echo "  0) 退出"
     echo "==================================================="
 
-    read -r -p "请输入选项 [0-12]: " choice
+    read -r -p "请输入选项 [0-12]: " choice || exit 0
 
     case "$choice" in
         1) deploy_dujiao_next ;;
@@ -1159,6 +1441,14 @@ main_menu() {
     esac
 }
 
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
+
+if [[ $EUID -ne 0 ]]; then
+    die "请使用 root 用户运行。"
+fi
+
 if [[ "${1:-}" == "run-backup" ]]; then
     do_backup
 else
@@ -1169,6 +1459,6 @@ else
     while true; do
         main_menu
         echo ""
-        read -r -p "按回车返回主菜单..."
+        read -r -p "按回车返回主菜单..." || exit 0
     done
 fi
